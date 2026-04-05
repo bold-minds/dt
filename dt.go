@@ -1,32 +1,87 @@
+// Package dt provides ergonomic datetime parsing and formatting for Go.
+//
+// The canonical API is small:
+//
+//	dt.New(value, opts...)   // format any supported value to a string
+//	dt.Parse(value)          // parse to time.Time, returns zero on failure
+//	dt.ParseAny(value)       // parse to (time.Time, error) — preferred
+//
+// Values accepted by Parse and ParseAny: time.Time, any int/uint/float width,
+// and strings in many common formats (RFC3339, RFC3339Nano, date-only,
+// US/EU numeric, month-name natural language, and numeric Unix timestamps).
+//
+// Output format is controlled via Format (interface) values, constructed by
+// ISO(), Unix(), and Custom(pattern). Options (Option interface) configure
+// DateOnly, TimeOnly, timezone conversion, and output format.
+//
+// go.mod targets go 1.21 intentionally: this library is published and the
+// Goby library family keeps broad compatibility.
 package dt
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// DatetimeFormat represents a datetime output format
-type DatetimeFormat interface {
+// -----------------------------------------------------------------------------
+// Core types
+// -----------------------------------------------------------------------------
+
+// Format represents a datetime output format. Use ISO, Unix, or Custom to
+// construct one. The zero value of any concrete Format type is not meaningful;
+// callers should always use the constructors.
+type Format interface {
 	format(t time.Time) string
 }
 
-// DatetimeOption represents a datetime processing option
-type DatetimeOption interface {
+// Option configures parsing and formatting behavior for New. Construct options
+// via ToTimezone, DateOnly, TimeOnly, and FormatAs.
+type Option interface {
 	apply(config *datetimeConfig)
 }
 
-// Internal configuration for datetime processing
+// ParseResult is the structured result returned by the legacy ParseDatetime
+// function. Its zero value represents an unparsed result; it is only
+// meaningful when returned with a nil error.
+//
+// Format is the format label detected for a string input (e.g. "iso", "unix")
+// or the format label the caller supplied. It records what ParseDatetime
+// thinks the input *looked like*, not the parser that actually succeeded.
+type ParseResult struct {
+	UnixMillis int64
+	Format     string
+	Pattern    string
+}
+
+// datetimeConfig is the internal state assembled from Option values.
 type datetimeConfig struct {
 	dateOnly     bool
 	timeOnly     bool
 	timezone     *time.Location
-	outputFormat DatetimeFormat
+	outputFormat Format // nil means "use the default based on dateOnly/timeOnly"
 }
 
-// Legacy string constants for backward compatibility
+// Legacy type aliases preserved for source compatibility with dt v0.1.0.
+// New code should use the unprefixed names.
+//
+// Deprecated: use Format instead.
+type DatetimeFormat = Format
+
+// Deprecated: use Option instead.
+type DatetimeOption = Option
+
+// Deprecated: use ParseResult instead.
+type DatetimeParseResult = ParseResult
+
+// -----------------------------------------------------------------------------
+// Format label constants (used by the legacy API and DetectDatetimeFormat)
+// -----------------------------------------------------------------------------
+
 const (
 	FormatUnix   = "unix"
 	FormatISO    = "iso"
@@ -35,366 +90,643 @@ const (
 	FormatCustom = "custom"
 )
 
+// -----------------------------------------------------------------------------
 // Format implementations
+// -----------------------------------------------------------------------------
+
 type isoFormat struct{}
 type unixFormat struct{}
-type customFormat struct{ pattern string }
 
-func (f isoFormat) format(t time.Time) string {
-	return t.UTC().Format("2006-01-02T15:04:05Z")
+// customFormat caches its pre-tokenized layout so conversion runs once at
+// construction rather than on every format call.
+type customFormat struct {
+	pattern string
+	tokens  []patternToken
 }
 
-func (f unixFormat) format(t time.Time) string {
+// format emits t as RFC3339 in the time's current location, preserving the
+// numeric offset. This is both the "ISO" and "ISO-TZ" behavior: a UTC time
+// renders with "Z" and a non-UTC time renders with "±hh:mm".
+func (isoFormat) format(t time.Time) string {
+	return t.Format(time.RFC3339)
+}
+
+func (unixFormat) format(t time.Time) string {
 	return strconv.FormatInt(t.UnixMilli(), 10)
 }
 
 func (f customFormat) format(t time.Time) string {
-	goLayout := convertPatternToGoLayout(f.pattern)
-	result := t.Format(goLayout)
-	// Handle ordinal day formatting if present
-	if strings.Contains(result, "___999___") {
-		ordinalDay := getOrdinalDay(t.Day())
-		result = strings.ReplaceAll(result, "___999___", ordinalDay)
+	var b strings.Builder
+	b.Grow(len(f.pattern) + 16)
+	for _, tk := range f.tokens {
+		switch tk.kind {
+		case tokLiteral:
+			b.WriteString(tk.value)
+		case tokGoLayout:
+			b.WriteString(t.Format(tk.value))
+		case tokOrdinalDay:
+			b.WriteString(getOrdinalDay(t.Day()))
+		case tokMillis:
+			fmt.Fprintf(&b, "%03d", t.Nanosecond()/int(time.Millisecond))
+		}
 	}
-	return result
+	return b.String()
 }
 
+// ISO returns a format that emits RFC3339 with the time's location offset.
+// Unlike the legacy behavior this does NOT force UTC — a time carrying a
+// -05:00 offset formats with "-05:00", not "Z".
+func ISO() Format { return isoFormat{} }
+
+// Unix returns a format that emits the Unix time in milliseconds as a decimal
+// string.
+func Unix() Format { return unixFormat{} }
+
+// Custom returns a format that uses a human-friendly token pattern. Supported
+// tokens:
+//
+//	YYYY = 4-digit year        YY   = 2-digit year
+//	MMMM = full month name     MMM  = short month name
+//	MM   = 2-digit month       M    = 1-or-2 digit month
+//	DDD  = ordinal day (1st)   DD   = 2-digit day            D = 1-or-2 digit day
+//	HH   = 24-hour (00-23)     H    = 24-hour (Go has no 1-digit variant)
+//	hh   = 12-hour (01-12)     h    = 1-or-2 digit 12-hour
+//	mm   = 2-digit minute      m    = 1-or-2 digit minute
+//	ss   = 2-digit second      s    = 1-or-2 digit second
+//	.SSS = fractional seconds (3 digits, e.g. ".123")
+//	SSS  = milliseconds as 3 digits without a leading dot
+//
+// All other characters are emitted literally, including characters Go's own
+// time package would interpret as format verbs.
+func Custom(pattern string) Format {
+	return customFormat{pattern: pattern, tokens: tokenizePattern(pattern)}
+}
+
+// -----------------------------------------------------------------------------
 // Option implementations
+// -----------------------------------------------------------------------------
+
 type dateOnlyOption struct{}
 type timeOnlyOption struct{}
 type timezoneOption struct{ tz *time.Location }
-type formatAsOption struct{ format DatetimeFormat }
+type formatAsOption struct{ format Format }
 
-func (o dateOnlyOption) apply(config *datetimeConfig) {
-	config.dateOnly = true
-}
+func (dateOnlyOption) apply(c *datetimeConfig)      { c.dateOnly = true }
+func (timeOnlyOption) apply(c *datetimeConfig)      { c.timeOnly = true }
+func (o timezoneOption) apply(c *datetimeConfig)    { c.timezone = o.tz }
+func (o formatAsOption) apply(c *datetimeConfig)    { c.outputFormat = o.format }
 
-func (o timeOnlyOption) apply(config *datetimeConfig) {
-	config.timeOnly = true
-}
+// DateOnly returns an option that zeros the time-of-day components and,
+// unless FormatAs is also provided, switches the default output format to
+// "2006-01-02". DateOnly and TimeOnly are mutually exclusive; passing both
+// causes New to return the empty string.
+func DateOnly() Option { return dateOnlyOption{} }
 
-func (o timezoneOption) apply(config *datetimeConfig) {
-	config.timezone = o.tz
-}
+// TimeOnly returns an option that zeros the date components (preserving the
+// clock) and, unless FormatAs is also provided, switches the default output
+// format to "15:04:05". DateOnly and TimeOnly are mutually exclusive; passing
+// both causes New to return the empty string.
+func TimeOnly() Option { return timeOnlyOption{} }
 
-func (o formatAsOption) apply(config *datetimeConfig) {
-	config.outputFormat = o.format
-}
+// ToTimezone returns an option that converts the parsed time to the given
+// location before formatting. A nil location is a no-op and preserves the
+// parsed time's location.
+func ToTimezone(tz *time.Location) Option { return timezoneOption{tz: tz} }
 
-// NewDatetime parses a datetime value and returns a formatted string
-func NewDatetime(value any, opts ...DatetimeOption) string {
-	// Parse to time.Time first
+// FormatAs returns an option that selects the output format explicitly.
+func FormatAs(format Format) Option { return formatAsOption{format: format} }
+
+// -----------------------------------------------------------------------------
+// Canonical API: New, Parse, ParseAny
+// -----------------------------------------------------------------------------
+
+// New parses value and formats it according to the given options, returning
+// the formatted string. It returns the empty string if value cannot be
+// parsed, if the type is unsupported, or if DateOnly and TimeOnly are both
+// specified. Callers who need to distinguish these cases should use ParseAny.
+func New(value any, opts ...Option) string {
 	t := parseToTime(value)
 	if t.IsZero() {
-		return "" // Return empty string for invalid dates
+		return ""
 	}
 
-	// Apply options
-	config := &datetimeConfig{
-		outputFormat: isoFormat{}, // Default to ISO format
-	}
+	cfg := &datetimeConfig{}
 	for _, opt := range opts {
-		opt.apply(config)
+		opt.apply(cfg)
 	}
 
-	// Apply timezone if specified
-	if config.timezone != nil {
-		t = t.In(config.timezone)
+	// Mutually exclusive: both set is a programming error, return empty.
+	if cfg.dateOnly && cfg.timeOnly {
+		return ""
 	}
 
-	// Apply date/time only filters
-	if config.dateOnly {
-		// Zero out time components
+	if cfg.timezone != nil {
+		t = t.In(cfg.timezone)
+	}
+
+	// Normalize the timestamp. Note: we zero components in t.Location() so
+	// that subsequent formatting (which we also perform in t.Location()) does
+	// not roll the date across a timezone boundary — that was the pre-fix bug
+	// where DateOnly + a non-UTC timezone produced the wrong date.
+	switch {
+	case cfg.dateOnly:
 		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-	} else if config.timeOnly {
-		// Zero out date components, keep time
+	case cfg.timeOnly:
 		t = time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
 	}
 
-	// Format output
-	return config.outputFormat.format(t)
+	// Pick default format based on filters if the caller did not select one.
+	if cfg.outputFormat == nil {
+		switch {
+		case cfg.dateOnly:
+			cfg.outputFormat = Custom("YYYY-MM-DD")
+		case cfg.timeOnly:
+			cfg.outputFormat = Custom("HH:mm:ss")
+		default:
+			cfg.outputFormat = ISO()
+		}
+	}
+
+	return cfg.outputFormat.format(t)
 }
 
-// ToDatetime parses a string value and returns a time.Time
-func ToDatetime(value string) time.Time {
+// Parse parses value to a time.Time. It returns the zero time on any failure.
+// Callers who need to distinguish "unparseable" from "unsupported type" should
+// use ParseAny.
+func Parse(value any) time.Time {
 	return parseToTime(value)
 }
 
-// parseToTime handles the core parsing logic, returning time.Time
+// ParseAny parses value to a time.Time and returns a descriptive error on
+// failure. This is the preferred primitive for callers that need to
+// distinguish unparseable input from an unsupported type or a zero time.Time.
+func ParseAny(value any) (time.Time, error) {
+	if value == nil {
+		return time.Time{}, fmt.Errorf("dt: cannot parse nil")
+	}
+	t := parseToTime(value)
+	if t.IsZero() {
+		switch v := value.(type) {
+		case time.Time:
+			// Caller passed a zero time deliberately; surface as error.
+			return time.Time{}, fmt.Errorf("dt: zero time.Time is not a valid datetime")
+		case string:
+			return time.Time{}, fmt.Errorf("dt: cannot parse %q as datetime", v)
+		case int, int8, int16, int32, int64,
+			uint, uint8, uint16, uint32, uint64,
+			float32, float64:
+			return time.Time{}, fmt.Errorf("dt: numeric value %v out of valid timestamp range", v)
+		default:
+			return time.Time{}, fmt.Errorf("dt: unsupported type %T for datetime parsing", value)
+		}
+	}
+	return t, nil
+}
+
+// -----------------------------------------------------------------------------
+// Parsing core
+// -----------------------------------------------------------------------------
+
+// parseToTime normalizes any supported input type to a time.Time. It returns
+// a zero time.Time on any failure. All integer and unsigned integer widths
+// are supported; float widths preserve sub-second precision where possible.
 func parseToTime(value any) time.Time {
 	switch v := value.(type) {
 	case time.Time:
 		return v
-	case int64:
-		return parseUnixTimestamp(v)
-	case float64:
-		return parseUnixTimestamp(int64(v))
-	case int:
-		return parseUnixTimestamp(int64(v))
 	case string:
 		return parseDatetimeString(v)
+
+	// Signed integer widths — all funnel through parseUnixTimestamp.
+	case int:
+		return parseUnixTimestamp(int64(v))
+	case int8:
+		return parseUnixTimestamp(int64(v))
+	case int16:
+		return parseUnixTimestamp(int64(v))
+	case int32:
+		return parseUnixTimestamp(int64(v))
+	case int64:
+		return parseUnixTimestamp(v)
+
+	// Unsigned integer widths. uint64 can exceed int64 range, so we check.
+	case uint:
+		if uint64(v) > uint64(1<<63-1) {
+			return time.Time{}
+		}
+		return parseUnixTimestamp(int64(v))
+	case uint8:
+		return parseUnixTimestamp(int64(v))
+	case uint16:
+		return parseUnixTimestamp(int64(v))
+	case uint32:
+		return parseUnixTimestamp(int64(v))
+	case uint64:
+		if v > uint64(1<<63-1) {
+			return time.Time{}
+		}
+		return parseUnixTimestamp(int64(v))
+
+	// Float widths preserve sub-second precision.
+	case float32:
+		return parseUnixFloat(float64(v))
+	case float64:
+		return parseUnixFloat(v)
+
 	default:
-		return time.Time{} // Zero time for unsupported types
+		return time.Time{}
 	}
 }
 
-// parseUnixTimestamp handles numeric Unix timestamp inputs
+// Maximum accepted Unix timestamp: 9999999999999 milliseconds ≈ year 2286.
+// The same bound applies to every numeric entry point (string, int, float) so
+// callers get identical validity envelopes regardless of input type.
+const maxUnixMillis int64 = 9999999999999
+
+// parseUnixTimestamp converts an integer Unix timestamp to time.Time. Values
+// with fewer than 10 digits (< 10^10) are interpreted as seconds; larger
+// values up to maxUnixMillis are interpreted as milliseconds. Microsecond and
+// nanosecond timestamps are rejected — callers that need them should convert
+// to time.Time directly.
 func parseUnixTimestamp(timestamp int64) time.Time {
-	// Validate timestamp range (reasonable bounds)
-	if timestamp < 0 || timestamp > 9999999999999 { // Year ~2286
+	if timestamp < 0 || timestamp > maxUnixMillis {
 		return time.Time{}
 	}
-
-	// Convert seconds to milliseconds if needed (heuristic: < 10^10 = seconds)
-	if timestamp < 10000000000 {
-		timestamp *= 1000
+	if timestamp < 10000000000 { // < 10^10: interpret as seconds
+		return time.Unix(timestamp, 0).UTC()
 	}
-
 	return time.UnixMilli(timestamp).UTC()
 }
 
-// isDatetime performs a fast heuristic check to determine if a string is likely a datetime
-// This avoids expensive parsing attempts on non-datetime strings
+// parseUnixFloat converts a float Unix timestamp to time.Time, preserving
+// fractional seconds. Values < 10^10 are treated as seconds (fractional part
+// is nanoseconds); values >= 10^10 are treated as milliseconds (fractional
+// part is discarded — sub-millisecond precision is not representable there).
+//
+// NaN and ±Inf are rejected explicitly. Every comparison with NaN is false,
+// so without this guard a NaN input would fall through the range checks into
+// int64(NaN) — which is implementation-defined, typically MinInt64 on amd64,
+// producing a wildly wrong "valid-looking" time.Time. Memory note from the
+// Goby review: NaN handling is a standing review checkpoint for this family.
+func parseUnixFloat(v float64) time.Time {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return time.Time{}
+	}
+	if v < 0 || v > float64(maxUnixMillis) {
+		return time.Time{}
+	}
+	if v < 10000000000 {
+		sec := int64(v)
+		nsec := int64((v - float64(sec)) * 1e9)
+		return time.Unix(sec, nsec).UTC()
+	}
+	return time.UnixMilli(int64(v)).UTC()
+}
+
+// isDatetime performs a fast heuristic reject for strings that obviously are
+// not datetime-shaped. A true result does not guarantee the string parses; a
+// false result guarantees we skip the (expensive) layout-tryout loop.
 func isDatetime(s string) bool {
-	// Quick length check - minimum 6 characters for valid datetime (e.g., "1-2-34")
 	sLen := len(s)
-	if sLen < 6 || sLen > 30 {
+	// Upper bound covers RFC3339Nano with offset (~35 chars) plus slack.
+	if sLen == 0 || sLen > 64 {
 		return false
 	}
 
-	// Fast check for common datetime patterns
-	// ISO format: contains T and digits
-	if strings.Contains(s, "T") && strings.ContainsAny(s, "0123456789") {
-		return true
+	// Fast path: pure-digit strings get treated as potential Unix timestamps
+	// with the same range as parseUnixTimestamp accepts (≤ 13 digits).
+	allDigits := true
+	for i := 0; i < sLen; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return sLen <= 13
 	}
 
-	// Fast byte-level scan for datetime indicators
-	hasDigit := false
-	hasSeparator := false
-	digitCount := 0
-	letterCount := 0
-	spaceCount := 0
+	// Non-numeric strings need a minimum shape.
+	if sLen < 6 {
+		return false
+	}
 
-	// Single pass through string bytes (faster than runes)
+	// Fast path: strings containing "T" and at least one digit are overwhelmingly
+	// ISO-like and worth trying.
+	if strings.IndexByte(s, 'T') >= 0 {
+		for i := 0; i < sLen; i++ {
+			if s[i] >= '0' && s[i] <= '9' {
+				return true
+			}
+		}
+	}
+
+	var (
+		hasDigit     bool
+		hasSeparator bool
+		digitCount   int
+		letterCount  int
+		spaceCount   int
+	)
 	for i := 0; i < sLen; i++ {
 		b := s[i]
-		if b >= '0' && b <= '9' {
+		switch {
+		case b >= '0' && b <= '9':
 			hasDigit = true
 			digitCount++
-		} else if b == '-' || b == '/' || b == ':' || b == 'T' || b == 'Z' || b == '.' || b == ',' {
+		case b == '-' || b == '/' || b == ':' || b == 'T' || b == 'Z' || b == '.' || b == ',':
 			hasSeparator = true
-		} else if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') {
+		case (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
 			letterCount++
-			// Reject early if too many letters (likely text, not datetime)
-			// Allow more letters for full month names and ordinal patterns
 			if letterCount > 12 {
 				return false
 			}
-		} else if b == ' ' {
+		case b == ' ':
 			spaceCount++
 		}
 	}
-
-	// Must have digits
 	if !hasDigit {
 		return false
 	}
-
-	// Allow pure numeric strings (Unix timestamps) if they're reasonable length
+	// No separators and no spaces at this point means non-numeric junk — the
+	// all-digit fast path above already handled the valid shape.
 	if !hasSeparator && spaceCount == 0 {
-		// Unix timestamps are typically 10 digits (seconds) or 13 digits (milliseconds)
-		return sLen >= 10 && sLen <= 13 && digitCount == sLen
+		return false
 	}
 
-	// Handle special cases with spaces
 	if spaceCount > 0 {
-		// For multiple spaces (like "2023 01 15"), treat as valid datetime separators
 		if spaceCount > 1 {
-			return true // Multiple spaces likely indicate date/time components
+			return true
 		}
-
-		// Find the last space and check what follows
-		lastSpaceIdx := -1
-		for i := sLen - 1; i >= 0; i-- {
-			if s[i] == ' ' {
-				lastSpaceIdx = i
-				break
+		// Exactly one space: inspect trailing segment for common junk
+		// (alphanumeric codes, long numeric IDs, short letter codes).
+		lastSpace := strings.LastIndexByte(s, ' ')
+		if lastSpace >= 0 && lastSpace < sLen-1 {
+			trailing := s[lastSpace+1:]
+			tLen := len(trailing)
+			if tLen == 2 && (trailing == "AM" || trailing == "PM" ||
+				trailing == "am" || trailing == "pm") {
+				return true
 			}
-		}
-
-		if lastSpaceIdx >= 0 && lastSpaceIdx < sLen-1 {
-			// Check the content after the last space
-			trailing := s[lastSpaceIdx+1:]
-			trailingLen := len(trailing)
-
-			// Allow AM/PM patterns
-			if trailingLen == 2 && (trailing == "AM" || trailing == "PM") {
-				return true // Valid time with AM/PM
-			}
-
-			// Reject if trailing content looks like a code/identifier
-			if trailingLen <= 6 {
-				// Check if it's all digits (likely a numeric code)
-				allDigits := true
-				for _, b := range trailing {
-					if b < '0' || b > '9' {
-						allDigits = false
-						break
+			if tLen <= 6 {
+				tDigits, tLetters := 0, 0
+				for i := 0; i < tLen; i++ {
+					b := trailing[i]
+					switch {
+					case b >= '0' && b <= '9':
+						tDigits++
+					case (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
+						tLetters++
 					}
 				}
-				// Allow 2-4 digit years (like "25" for 2025) but reject longer numeric codes
-				if allDigits && trailingLen >= 5 {
+				if tDigits == tLen && tLen >= 5 {
 					return false
 				}
-
-				// Check if it's a short alphanumeric code
-				hasTrailingDigit := false
-				hasTrailingLetter := false
-				for _, b := range trailing {
-					if b >= '0' && b <= '9' {
-						hasTrailingDigit = true
-					} else if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') {
-						hasTrailingLetter = true
-					}
+				if tDigits > 0 && tLetters > 0 {
+					return false
 				}
-				if hasTrailingDigit && hasTrailingLetter {
-					return false // Mixed alphanumeric code
-				}
-				if hasTrailingLetter && trailingLen <= 2 && trailing != "AM" && trailing != "PM" {
-					return false // Short letter code (but not AM/PM)
+				if tLetters > 0 && tLen <= 2 {
+					return false
 				}
 			}
 		}
 	}
-
-	// Must have reasonable digit ratio for datetime
 	return digitCount >= sLen/4
 }
 
-// parseDatetimeString handles string datetime inputs with multiple format attempts
+// parseLayouts is the ordered list of layouts attempted when an input string
+// doesn't parse as a Unix timestamp. time.RFC3339 and time.RFC3339Nano cover
+// the entire ISO 8601 family (with or without fractional seconds, Z or
+// numeric offset), replacing six hand-written variants in the v0.1.0 code.
+//
+// Note: both US ("01/02/2006") and European ("02/01/2006") orderings appear.
+// The US form is first, so ambiguous input like "03/04/2023" is parsed as
+// 2023-03-04 (March 4). This is documented behavior; callers with locale
+// knowledge should use ParseAny with a known unambiguous format upstream.
+var parseLayouts = [...]string{
+	time.RFC3339,
+	time.RFC3339Nano,
+	"2006-01-02",
+	"15:04:05",
+	"15:04",
+	"01/02/2006", // US
+	"1/2/2006",
+	"02/01/2006", // European
+	"2/1/2006",
+	"02.01.2006",
+	"2.1.2006",
+	"01-02-2006",
+	"1-2-2006",
+	"01/02/2006 15:04:05",
+	"02.01.2006 15:04:05",
+	"2006-01-02 15:04:05",
+	"Jan 2 2006",
+	"Jan 2, 2006",
+	"January 2 2006",
+	"January 2, 2006",
+	"2 Jan 2006",
+	"2 January 2006",
+	"Jan 2 06",
+	"Jan 2, 06",
+	"1/2/06",
+	"01/02/06",
+	"2/1/06",
+	"02/01/06",
+}
+
+// parseDatetimeString tries to parse a string datetime value using the shared
+// layout list. It preserves the parsed location — the value's original offset
+// is NOT forced to UTC.
 func parseDatetimeString(value string) time.Time {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return time.Time{}
 	}
-
-	// Fast heuristic check to avoid expensive parsing on non-datetime strings
 	if !isDatetime(value) {
 		return time.Time{}
 	}
+	value = stripOrdinalSuffixes(value)
 
-	// Convert ordinal days to regular numbers for parsing (e.g., "jan 4th 25" -> "jan 4 25")
-	value = convertOrdinalDaysForParsing(value)
-
-	// Try to parse as Unix timestamp string first
-	if timestamp, err := strconv.ParseInt(value, 10, 64); err == nil {
-		return parseUnixTimestamp(timestamp)
+	if ts, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return parseUnixTimestamp(ts)
 	}
 
-	// Define common datetime layouts for parsing
-	layouts := []string{
-		// ISO 8601 formats
-		"2006-01-02T15:04:05Z",
-		"2006-01-02T15:04:05.000Z",
-		"2006-01-02T15:04:05-07:00",
-		"2006-01-02T15:04:05.000-07:00",
-		"2006-01-02T15:04:05+07:00",
-		"2006-01-02T15:04:05.000+07:00",
-
-		// Date-only formats
-		"2006-01-02",
-
-		// Time-only formats
-		"15:04:05",
-		"15:04",
-
-		// Common alternative formats
-		"01/02/2006",
-		"1/2/2006",
-		"02/01/2006", // European style
-		"2/1/2006",
-		"02.01.2006", // European with periods
-		"2.1.2006",
-		"01-02-2006",
-		"1-2-2006",
-
-		// Date with time
-		"01/02/2006 15:04:05",
-		"02.01.2006 15:04:05",
-		"2006-01-02 15:04:05",
-
-		// Natural language formats with month names
-		"Jan 2 2006",
-		"Jan 2, 2006",
-		"January 2 2006",
-		"January 2, 2006",
-		"2 Jan 2006",
-		"2 January 2006",
-
-		// Short year formats
-		"Jan 2 06",
-		"Jan 2, 06",
-		"1/2/06",
-		"01/02/06",
-		"2/1/06", // European
-		"02/01/06",
-	}
-
-	// Try each layout
-	for _, layout := range layouts {
-		if parsedTime, err := time.Parse(layout, value); err == nil {
-			return parsedTime.UTC()
+	for _, layout := range parseLayouts {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed
 		}
 	}
-
-	return time.Time{} // Return zero time if parsing fails
+	return time.Time{}
 }
 
-// convertPatternToGoLayout converts our custom pattern format to Go's time layout
-// Supports ordinal day formatting (DDD) and other common patterns
-func convertPatternToGoLayout(pattern string) string {
-	// Basic conversions for common patterns
-	goLayout := pattern
+// -----------------------------------------------------------------------------
+// Custom pattern tokenizer (token-walker, not cascading ReplaceAll)
+// -----------------------------------------------------------------------------
 
-	// Year
-	goLayout = strings.ReplaceAll(goLayout, "YYYY", "2006")
-	goLayout = strings.ReplaceAll(goLayout, "YY", "06")
+type tokenKind int
 
-	// Month
-	goLayout = strings.ReplaceAll(goLayout, "MMM", "Jan")
-	goLayout = strings.ReplaceAll(goLayout, "MM", "01")
-	goLayout = strings.ReplaceAll(goLayout, "M", "1")
+const (
+	tokLiteral tokenKind = iota
+	tokGoLayout
+	tokOrdinalDay
+	tokMillis
+)
 
-	// Day - handle ordinal day (DDD) before regular day patterns
-	// Note: Go doesn't natively support ordinal days, so we use a custom approach
-	if strings.Contains(goLayout, "DDD") {
-		// For ordinal days, we'll use a special marker that we'll handle in FormatDatetime
-		// Use a placeholder that won't be interpreted by Go's time formatting
-		// Avoid any letters that Go uses as format tokens (MST, PM, Jan, Mon, etc.)
-		// Use only symbols and numbers that Go doesn't interpret
-		goLayout = strings.ReplaceAll(goLayout, "DDD", "___999___")
+type patternToken struct {
+	kind  tokenKind
+	value string // Go layout fragment for tokGoLayout, literal text for tokLiteral
+}
+
+// patternRule maps a human-friendly token to either a Go time-layout fragment
+// or a special token kind. Rules are sorted longest-first before use so that
+// "MMMM" matches before "MMM" and ".SSS" matches before "SSS".
+//
+// allAlpha is set for rules whose token is composed entirely of ASCII
+// letters. These rules only match at word boundaries — if the character
+// immediately before or after the match is also a letter, the rule does not
+// match. This prevents single-letter tokens like "M" or "h" from corrupting
+// literal words such as "Month:" or "Hour:" (BUG-1).
+type patternRule struct {
+	token    string
+	kind     tokenKind
+	goLayout string
+	allAlpha bool
+}
+
+// isASCIIAlpha reports whether b is an ASCII letter.
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// isAllASCIIAlpha reports whether every byte of s is an ASCII letter.
+func isAllASCIIAlpha(s string) bool {
+	if s == "" {
+		return false
 	}
-	goLayout = strings.ReplaceAll(goLayout, "DD", "02")
-	goLayout = strings.ReplaceAll(goLayout, "D", "2")
-
-	// Hour
-	goLayout = strings.ReplaceAll(goLayout, "HH", "15")
-	goLayout = strings.ReplaceAll(goLayout, "H", "15")
-	goLayout = strings.ReplaceAll(goLayout, "hh", "03")
-	goLayout = strings.ReplaceAll(goLayout, "h", "3")
-
-	// Minute
-	goLayout = strings.ReplaceAll(goLayout, "mm", "04")
-	goLayout = strings.ReplaceAll(goLayout, "m", "4")
-
-	// Second
-	goLayout = strings.ReplaceAll(goLayout, "ss", "05")
-	goLayout = strings.ReplaceAll(goLayout, "s", "5")
-
-	return goLayout
+	for i := 0; i < len(s); i++ {
+		if !isASCIIAlpha(s[i]) {
+			return false
+		}
+	}
+	return true
 }
 
-// getOrdinalDay converts a day number to ordinal format (1st, 2nd, 3rd, etc.)
+var patternRules = func() []patternRule {
+	rules := []patternRule{
+		// Year
+		{token: "YYYY", kind: tokGoLayout, goLayout: "2006"},
+		{token: "YY", kind: tokGoLayout, goLayout: "06"},
+		// Month
+		{token: "MMMM", kind: tokGoLayout, goLayout: "January"},
+		{token: "MMM", kind: tokGoLayout, goLayout: "Jan"},
+		{token: "MM", kind: tokGoLayout, goLayout: "01"},
+		{token: "M", kind: tokGoLayout, goLayout: "1"},
+		// Day — DDD (ordinal) must come before DD/D
+		{token: "DDD", kind: tokOrdinalDay},
+		{token: "DD", kind: tokGoLayout, goLayout: "02"},
+		{token: "D", kind: tokGoLayout, goLayout: "2"},
+		// Hour (24-hour). Go has no single-digit 24-hour verb — "H" and "HH"
+		// both emit "15" (zero-padded 00..23). Callers needing unpadded
+		// 24-hour output must post-process.
+		{token: "HH", kind: tokGoLayout, goLayout: "15"},
+		{token: "H", kind: tokGoLayout, goLayout: "15"},
+		// Hour (12-hour)
+		{token: "hh", kind: tokGoLayout, goLayout: "03"},
+		{token: "h", kind: tokGoLayout, goLayout: "3"},
+		// Minute
+		{token: "mm", kind: tokGoLayout, goLayout: "04"},
+		{token: "m", kind: tokGoLayout, goLayout: "4"},
+		// Second
+		{token: "ss", kind: tokGoLayout, goLayout: "05"},
+		{token: "s", kind: tokGoLayout, goLayout: "5"},
+		// Fractional seconds — ".SSS" must come before "SSS" so "HH:mm:ss.SSS"
+		// tokenizes the dot+fractional as a single unit.
+		{token: ".SSS", kind: tokGoLayout, goLayout: ".000"},
+		{token: "SSS", kind: tokMillis},
+	}
+	for i := range rules {
+		rules[i].allAlpha = isAllASCIIAlpha(rules[i].token)
+	}
+	sort.SliceStable(rules, func(i, j int) bool {
+		return len(rules[i].token) > len(rules[j].token)
+	})
+	return rules
+}()
+
+// tokenizePattern walks pattern once, emitting tokens for recognized tokens
+// and accumulating everything else as literal runs. This replaces the
+// cascading strings.ReplaceAll approach, which corrupted literal text by
+// letting each replacement's output feed into the next rule.
+func tokenizePattern(pattern string) []patternToken {
+	var out []patternToken
+	var lit strings.Builder
+	flushLit := func() {
+		if lit.Len() > 0 {
+			out = append(out, patternToken{kind: tokLiteral, value: lit.String()})
+			lit.Reset()
+		}
+	}
+	// prevWasToken records whether the previous character was consumed by a
+	// token rule. The left-boundary check allows alpha-only tokens to follow
+	// other tokens (so "HHmm" correctly tokenizes as HH + mm) but rejects
+	// them when the previous character was a literal letter (so "Month:" is
+	// not mangled by the "M" rule).
+	prevWasToken := false
+	i := 0
+	for i < len(pattern) {
+		matched := false
+		for _, r := range patternRules {
+			if !strings.HasPrefix(pattern[i:], r.token) {
+				continue
+			}
+			// Word-boundary check for all-alphabetic tokens. A token match
+			// is valid if:
+			//   - left side: start-of-pattern, previous char non-alpha, or
+			//     previous char was part of another token
+			//   - right side: end-of-pattern, next char non-alpha, or the
+			//     remaining pattern starts with another alpha token
+			if r.allAlpha {
+				if i > 0 && !prevWasToken && isASCIIAlpha(pattern[i-1]) {
+					continue
+				}
+				end := i + len(r.token)
+				if end < len(pattern) && isASCIIAlpha(pattern[end]) &&
+					!startsWithAlphaToken(pattern[end:]) {
+					continue
+				}
+			}
+			flushLit()
+			out = append(out, patternToken{kind: r.kind, value: r.goLayout})
+			i += len(r.token)
+			prevWasToken = true
+			matched = true
+			break
+		}
+		if !matched {
+			lit.WriteByte(pattern[i])
+			i++
+			prevWasToken = false
+		}
+	}
+	flushLit()
+	return out
+}
+
+// startsWithAlphaToken reports whether s begins with any of our alphabetic
+// pattern tokens (YYYY, MMMM, HH, ss, etc.). Used by the tokenizer's
+// right-boundary check to allow tokens to sit immediately adjacent to each
+// other ("HHmmss" → HH + mm + ss) while still rejecting tokens embedded in
+// literal words.
+func startsWithAlphaToken(s string) bool {
+	for _, r := range patternRules {
+		if r.allAlpha && strings.HasPrefix(s, r.token) {
+			return true
+		}
+	}
+	return false
+}
+
+// getOrdinalDay converts a day-of-month number to ordinal format.
 func getOrdinalDay(day int) string {
 	switch {
 	case day >= 11 && day <= 13:
@@ -410,207 +742,14 @@ func getOrdinalDay(day int) string {
 	}
 }
 
-// convertOrdinalDaysForParsing converts ordinal days (1st, 2nd, etc.) back to regular numbers for parsing
-func convertOrdinalDaysForParsing(value string) string {
-	result := value
+// ordinalSuffixRE matches any ordinal suffix (1st, 2nd, 3rd, 4th, ...) in any
+// case combination, anchored to a digit run. Using a regex avoids the
+// arithmetic-coincidence fragility of the prior substring-replace approach
+// and handles mixed-case input ("2Nd", "31St") uniformly.
+var ordinalSuffixRE = regexp.MustCompile(`(?i)(\d+)(st|nd|rd|th)\b`)
 
-	// Replace ordinal suffixes with just the number (case-insensitive)
-	// Use case-insensitive replacement without converting the entire string
-	result = replaceOrdinalSuffix(result, "1st", "1")
-	result = replaceOrdinalSuffix(result, "2nd", "2")
-	result = replaceOrdinalSuffix(result, "3rd", "3")
-
-	// Handle all other ordinal numbers (4th, 5th, ..., 31st)
-	for i := 1; i <= 31; i++ {
-		ordinal := getOrdinalDay(i)
-		result = replaceOrdinalSuffix(result, ordinal, strconv.Itoa(i))
-	}
-
-	return result
-}
-
-// replaceOrdinalSuffix performs case-insensitive replacement of ordinal suffixes
-func replaceOrdinalSuffix(s, old, replacement string) string {
-	// Replace both lowercase and uppercase versions
-	s = strings.ReplaceAll(s, old, replacement)
-	s = strings.ReplaceAll(s, strings.ToUpper(old), replacement)
-	// Handle title case manually (first letter uppercase, rest lowercase)
-	if len(old) > 0 {
-		titleCase := strings.ToUpper(old[:1]) + strings.ToLower(old[1:])
-		s = strings.ReplaceAll(s, titleCase, replacement)
-	}
-	return s
-}
-
-// Format helper functions
-
-// ISO returns an ISO format
-func ISO() DatetimeFormat {
-	return isoFormat{}
-}
-
-// Unix returns a Unix timestamp format
-func Unix() DatetimeFormat {
-	return unixFormat{}
-}
-
-// Custom returns a custom pattern format
-func Custom(pattern string) DatetimeFormat {
-	return customFormat{pattern: pattern}
-}
-
-// Option helper functions
-
-// DateOnly returns an option to include only date components
-func DateOnly() DatetimeOption {
-	return dateOnlyOption{}
-}
-
-// TimeOnly returns an option to include only time components
-func TimeOnly() DatetimeOption {
-	return timeOnlyOption{}
-}
-
-// ToTimezone creates an option to convert the datetime to a specific timezone
-func ToTimezone(tz *time.Location) DatetimeOption {
-	return timezoneOption{tz: tz}
-}
-
-// FormatAs returns an option to format output using the specified format
-func FormatAs(format DatetimeFormat) DatetimeOption {
-	return formatAsOption{format: format}
-}
-
-// Legacy API for backward compatibility
-
-// DatetimeParseResult represents the result of parsing a datetime
-type DatetimeParseResult struct {
-	UnixMillis int64
-	Format     string
-	Pattern    string
-}
-
-// ParseDatetime is the legacy function that parses datetime values
-func ParseDatetime(value any, expectedFormat string, customPattern string) (*DatetimeParseResult, error) {
-	// Convert to time.Time using new API
-	var t time.Time
-
-	switch v := value.(type) {
-	case string:
-		t = ToDatetime(v)
-		if t.IsZero() {
-			return nil, fmt.Errorf("unable to parse datetime string: %s", v)
-		}
-	case int64:
-		if v < 0 || v > 99999999999999 {
-			return nil, fmt.Errorf("timestamp out of valid range: %d", v)
-		}
-		// Auto-detect if it's seconds or milliseconds
-		if v < 10000000000 { // Less than 10 billion = seconds
-			t = time.Unix(v, 0).UTC()
-		} else {
-			t = time.UnixMilli(v).UTC()
-		}
-	case int:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
-	case float64:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
-	default:
-		return nil, fmt.Errorf("unsupported type for datetime parsing: %T", value)
-	}
-
-	// Determine format if not specified
-	format := expectedFormat
-	if format == "" {
-		if str, ok := value.(string); ok {
-			format = DetectDatetimeFormat(str)
-		} else {
-			format = FormatUnix
-		}
-	}
-
-	return &DatetimeParseResult{
-		UnixMillis: t.UnixMilli(),
-		Format:     format,
-		Pattern:    customPattern,
-	}, nil
-}
-
-// DetectDatetimeFormat detects the format of a datetime string
-func DetectDatetimeFormat(input string) string {
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return FormatCustom
-	}
-
-	// Unix timestamp
-	if matched, _ := regexp.MatchString(`^\d{10,13}$`, input); matched {
-		return FormatUnix
-	}
-
-	// ISO format with Z
-	if matched, _ := regexp.MatchString(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$`, input); matched {
-		return FormatISO
-	}
-
-	// ISO format with timezone
-	if matched, _ := regexp.MatchString(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$`, input); matched {
-		return FormatISOTZ
-	}
-
-	// Date only
-	if matched, _ := regexp.MatchString(`^\d{4}-\d{2}-\d{2}$`, input); matched {
-		return FormatDate
-	}
-
-	return FormatCustom
-}
-
-// IsValidDatetimeFormat checks if a format string is valid
-func IsValidDatetimeFormat(format string) bool {
-	validFormats := []string{FormatUnix, FormatISO, FormatISOTZ, FormatDate, FormatCustom}
-	for _, valid := range validFormats {
-		if format == valid {
-			return true
-		}
-	}
-	// Also accept custom patterns
-	return len(format) > 0 && format != "invalid"
-}
-
-// Legacy function for backward compatibility - now simplified
-func FormatDatetime(unixMillis int64, format string, customPattern string) (string, error) {
-	t := time.UnixMilli(unixMillis).UTC()
-	var fmt DatetimeFormat
-
-	switch format {
-	case FormatUnix:
-		fmt = Unix()
-	case FormatISO:
-		fmt = ISO()
-	case FormatISOTZ:
-		fmt = ISO() // ISOTZ uses same format as ISO for UTC times
-	case FormatDate:
-		fmt = Custom("2006-01-02") // Date only format
-	case FormatCustom:
-		if customPattern != "" {
-			fmt = Custom(customPattern)
-		} else {
-			fmt = Unix() // Fallback
-		}
-	default:
-		fmt = Unix() // Default fallback to unix
-	}
-
-	return fmt.format(t), nil
-}
-
-// ParseTimeString is a helper function for internal use by typ package
-// It provides a simple time.Time result compatible with existing ToType functionality
-func ParseTimeString(s string) (time.Time, error) {
-	result := ToDatetime(s)
-	if result.IsZero() {
-		return time.Time{}, fmt.Errorf("unable to parse datetime string: %s", s)
-	}
-	return result, nil
+// stripOrdinalSuffixes removes ordinal suffixes from a datetime string so the
+// remaining digits can be parsed by time.Parse. "jan 4th 25" → "jan 4 25".
+func stripOrdinalSuffixes(s string) string {
+	return ordinalSuffixRE.ReplaceAllString(s, "$1")
 }

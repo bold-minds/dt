@@ -1,1137 +1,696 @@
 package dt_test
 
 import (
-	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/bold-minds/dt"
 )
 
-func TestNewDatetimeWithTimestamps(t *testing.T) {
-	tests := []struct {
-		name      string
-		timestamp int64
-		wantEmpty bool
-	}{
-		{"valid seconds timestamp", 1672574400, false},
-		{"valid milliseconds timestamp", 1672574400000, false},
-		{"future timestamp", 9999999999999, false},
-	}
+// ---------------------------------------------------------------------------
+// Canonical API: New + Parse + ParseAny
+// ---------------------------------------------------------------------------
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.NewDatetime(tt.timestamp)
-			if tt.wantEmpty {
-				if result != "" {
-					t.Errorf("NewDatetime() should return empty string for invalid input, got %v", result)
-				}
-			} else {
-				if result == "" {
-					t.Errorf("NewDatetime() should return formatted string for valid input")
-				}
+// Well-known reference instant used across most tests: 2023-01-15T12:00:00Z.
+const refISO = "2023-01-15T12:00:00Z"
+
+func TestNew_NumericTimestamps(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"seconds int64", int64(1673784000), "2023-01-15T12:00:00Z"},
+		{"millis int64", int64(1673784000000), "2023-01-15T12:00:00Z"},
+		{"seconds int", int(1673784000), "2023-01-15T12:00:00Z"},
+		{"seconds int32", int32(1673784000), "2023-01-15T12:00:00Z"},
+		{"seconds uint32", uint32(1673784000), "2023-01-15T12:00:00Z"},
+		{"seconds float64", float64(1673784000), "2023-01-15T12:00:00Z"},
+		{"zero epoch", int64(0), "1970-01-01T00:00:00Z"},
+		{"max bound", int64(9999999999999), "2286-11-20T17:46:39Z"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dt.New(tc.value)
+			if got != tc.want {
+				t.Errorf("New(%v) = %q, want %q", tc.value, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestNewDatetimeWithStrings(t *testing.T) {
+func TestNew_StringInputs(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
+		want  string
 	}{
-		{"ISO format", "2023-01-01T12:00:00Z"},
-		{"ISO with milliseconds", "2023-01-01T12:00:00.000Z"},
-		{"ISO with timezone", "2023-01-01T12:00:00-05:00"},
-		{"Date only", "2023-01-01"},
-		{"US date format", "01/02/2023"},
-		{"European date format", "02/01/2023"},
-		{"Unix timestamp string", "1672574400"},
-		{"Ordinal day format", "jan 4th 25"},
-		{"Ordinal day with comma", "jan 4th, 25"},
-		{"Ordinal day full month", "january 4th 2025"},
-		{"Ordinal day mixed case", "Jan 4TH 25"},
-		{"Multiple ordinal formats", "feb 21st 2025"},
-		{"Ordinal day 2nd", "mar 2nd 2025"},
-		{"Ordinal day 3rd", "apr 3rd 2025"},
-		{"Ordinal day teens", "may 11th 2025"},
-		{"Ordinal day 31st", "dec 31st 2025"},
+		{"RFC3339 UTC", "2023-01-15T12:00:00Z", "2023-01-15T12:00:00Z"},
+		{"RFC3339Nano", "2023-01-15T12:00:00.123456789Z", "2023-01-15T12:00:00Z"},
+		{"RFC3339 offset", "2023-01-15T12:00:00-05:00", "2023-01-15T12:00:00-05:00"},
+		{"date only", "2023-01-15", "2023-01-15T00:00:00Z"},
+		{"US slash", "01/15/2023", "2023-01-15T00:00:00Z"},
+		{"unix-seconds string", "1673784000", "2023-01-15T12:00:00Z"},
+		{"unix-millis string", "1673784000000", "2023-01-15T12:00:00Z"},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.NewDatetime(tt.input)
-			if result == "" {
-				t.Errorf("NewDatetime() should return formatted string for valid input: %v", tt.input)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dt.New(tc.input)
+			if got != tc.want {
+				t.Errorf("New(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestOrdinalDayParsing(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected time.Time
-	}{
-		{
-			name:     "jan 4th 25",
-			input:    "jan 4th 25",
-			expected: time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "feb 21st 2025",
-			input:    "feb 21st 2025",
-			expected: time.Date(2025, 2, 21, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "mar 2nd 2025",
-			input:    "mar 2nd 2025",
-			expected: time.Date(2025, 3, 2, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "apr 3rd 2025",
-			input:    "apr 3rd 2025",
-			expected: time.Date(2025, 4, 3, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "may 11th 2025",
-			input:    "may 11th 2025",
-			expected: time.Date(2025, 5, 11, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "dec 31st 2025",
-			input:    "dec 31st 2025",
-			expected: time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "january 4th 2025",
-			input:    "january 4th 2025",
-			expected: time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC),
-		},
-		{
-			name:     "Jan 4TH 25 (mixed case)",
-			input:    "Jan 4TH 25",
-			expected: time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.NewDatetime(tt.input)
-			if result == "" {
-				t.Errorf("NewDatetime() failed to parse ordinal date: %v", tt.input)
-				return
-			}
-
-			// Parse the result back to verify it matches expected date
-			parsedResult, err := time.Parse("2006-01-02T15:04:05Z", result)
-			if err != nil {
-				t.Errorf("Failed to parse result datetime: %v", err)
-				return
-			}
-
-			// Compare dates (ignoring time components)
-			if parsedResult.Year() != tt.expected.Year() ||
-				parsedResult.Month() != tt.expected.Month() ||
-				parsedResult.Day() != tt.expected.Day() {
-				t.Errorf("NewDatetime() = %v, want date %v", parsedResult.Format("2006-01-02"), tt.expected.Format("2006-01-02"))
-			}
-		})
-	}
-}
-
-func TestToDatetime(t *testing.T) {
+func TestNew_InvalidInput(t *testing.T) {
 	tests := []struct {
 		name  string
-		input string
-	}{
-		{"ISO format", "2023-01-01T12:00:00Z"},
-		{"Date only", "2023-01-01"},
-		{"US format", "01/02/2023"},
-		{"Unix timestamp", "1672574400"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.ToDatetime(tt.input)
-			if result.IsZero() {
-				t.Errorf("ToDatetime() should return valid time.Time for input: %v", tt.input)
-			}
-		})
-	}
-}
-
-func TestNewDatetimeWithOptions(t *testing.T) {
-	t.Run("DateOnly option", func(t *testing.T) {
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.DateOnly())
-		if result == "" {
-			t.Error("NewDatetime with DateOnly should return formatted string")
-		}
-	})
-
-	t.Run("TimeOnly option", func(t *testing.T) {
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.TimeOnly())
-		if result == "" {
-			t.Error("NewDatetime with TimeOnly should return formatted string")
-		}
-	})
-
-	t.Run("Unix format option", func(t *testing.T) {
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.FormatAs(dt.Unix()))
-		if result == "" {
-			t.Error("NewDatetime with Unix format should return formatted string")
-		}
-	})
-
-	t.Run("ISO format option", func(t *testing.T) {
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.FormatAs(dt.ISO()))
-		if result == "" {
-			t.Error("NewDatetime with ISO format should return formatted string")
-		}
-	})
-
-	t.Run("Custom format option", func(t *testing.T) {
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.FormatAs(dt.Custom("2006-01-02")))
-		if result == "" {
-			t.Error("NewDatetime with Custom format should return formatted string")
-		}
-	})
-
-	t.Run("Timezone option", func(t *testing.T) {
-		ny, _ := time.LoadLocation("America/New_York")
-		result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.ToTimezone(ny))
-		if result == "" {
-			t.Error("NewDatetime with timezone should return formatted string")
-		}
-	})
-}
-
-func TestNewDatetimeErrorCases(t *testing.T) {
-	tests := []struct {
-		name  string
-		input any
+		value any
 	}{
 		{"empty string", ""},
-		{"invalid format", "not-a-date"},
+		{"garbage string", "not-a-date"},
 		{"unsupported type", []int{1, 2, 3}},
-		{"nil input", nil},
+		{"nil", nil},
+		{"negative timestamp", int64(-1)},
+		{"overflow timestamp", int64(99999999999999)},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.NewDatetime(tt.input)
-			if result != "" {
-				t.Errorf("NewDatetime() should return empty string for invalid input: %v, got: %v", tt.input, result)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dt.New(tc.value); got != "" {
+				t.Errorf("New(%v) = %q, want empty", tc.value, got)
 			}
 		})
 	}
 }
 
-func TestToDatetimeErrorCases(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"empty string", ""},
-		{"invalid format", "not-a-date"},
-		{"whitespace only", "   "},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.ToDatetime(tt.input)
-			if !result.IsZero() {
-				t.Errorf("ToDatetime() should return zero time for invalid input: %v", tt.input)
-			}
-		})
+func TestParse_Basic(t *testing.T) {
+	got := dt.Parse("2023-01-15T12:00:00Z")
+	want := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("Parse() = %v, want %v", got, want)
 	}
 }
 
-func TestParseTimeString(t *testing.T) {
+func TestParse_ZeroOnFailure(t *testing.T) {
+	for _, input := range []string{"", "not-a-date", "   "} {
+		if got := dt.Parse(input); !got.IsZero() {
+			t.Errorf("Parse(%q) = %v, want zero time", input, got)
+		}
+	}
+}
+
+func TestParseAny_ErrorCategorization(t *testing.T) {
 	tests := []struct {
 		name    string
-		input   string
-		wantErr bool
+		value   any
+		wantErr string
 	}{
-		{"ISO format", "2023-01-01T12:00:00Z", false},
-		{"Date only", "2023-01-01", false},
-		{"US format", "01/02/2023", false},
-		{"Unix timestamp", "1672574400", false},
-		{"Invalid format", "not-a-date", true},
-		{"Empty string", "", true},
+		{"nil", nil, "cannot parse nil"},
+		{"unparseable string", "nonsense", "cannot parse"},
+		{"unsupported type", []int{1}, "unsupported type"},
+		{"out-of-range int", int64(99999999999999), "out of valid timestamp range"},
+		{"zero time.Time", time.Time{}, "zero time.Time"},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.ParseTimeString(tt.input)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseTimeString() error = %v, wantErr %v", err, tt.wantErr)
-				return
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := dt.ParseAny(tc.value)
+			if err == nil {
+				t.Fatalf("ParseAny(%v) err = nil, want non-nil", tc.value)
 			}
-			if !tt.wantErr {
-				if result.IsZero() {
-					t.Errorf("ParseTimeString() returned zero time")
-				}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("ParseAny(%v) err = %q, want to contain %q", tc.value, err.Error(), tc.wantErr)
 			}
 		})
 	}
 }
 
+func TestParseAny_Success(t *testing.T) {
+	got, err := dt.ParseAny("2023-01-15T12:00:00Z")
+	if err != nil {
+		t.Fatalf("ParseAny err = %v", err)
+	}
+	want := time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("ParseAny() = %v, want %v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Options: DateOnly, TimeOnly, ToTimezone, FormatAs
+// ---------------------------------------------------------------------------
+
+func TestOption_DateOnly(t *testing.T) {
+	got := dt.New(refISO, dt.DateOnly())
+	if got != "2023-01-15" {
+		t.Errorf("DateOnly() = %q, want %q", got, "2023-01-15")
+	}
+}
+
+func TestOption_TimeOnly(t *testing.T) {
+	got := dt.New(refISO, dt.TimeOnly())
+	if got != "12:00:00" {
+		t.Errorf("TimeOnly() = %q, want %q", got, "12:00:00")
+	}
+}
+
+func TestOption_DateOnlyPlusTimeOnly_IsEmpty(t *testing.T) {
+	// BUG-10: mutually exclusive, must return empty string when both set.
+	got := dt.New(refISO, dt.DateOnly(), dt.TimeOnly())
+	if got != "" {
+		t.Errorf("DateOnly+TimeOnly = %q, want empty (mutually exclusive)", got)
+	}
+}
+
+func TestOption_DateOnlyHonorsExplicitFormat(t *testing.T) {
+	got := dt.New(refISO, dt.DateOnly(), dt.FormatAs(dt.Custom("DD/MM/YYYY")))
+	if got != "15/01/2023" {
+		t.Errorf("DateOnly+Custom = %q, want %q", got, "15/01/2023")
+	}
+}
+
+func TestOption_ToTimezone_Conversion(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	// 12:00 UTC is 07:00 EST (-05:00) on Jan 15.
+	got := dt.New(refISO, dt.ToTimezone(ny))
+	if got != "2023-01-15T07:00:00-05:00" {
+		t.Errorf("ToTimezone(NY) = %q, want %q", got, "2023-01-15T07:00:00-05:00")
+	}
+}
+
+func TestOption_ToTimezone_NilIsNoOp(t *testing.T) {
+	// BUG-13: nil location must not panic and must be equivalent to no option.
+	got := dt.New(refISO, dt.ToTimezone(nil))
+	if got != "2023-01-15T12:00:00Z" {
+		t.Errorf("ToTimezone(nil) = %q, want %q", got, "2023-01-15T12:00:00Z")
+	}
+}
+
+func TestOption_DateOnly_TimezoneDoesNotRollDate(t *testing.T) {
+	// BUG-2: v0.1.0 zeroed the clock in the local zone, then formatted via
+	// UTC, rolling the date across a DST or offset boundary. Kiritimati is
+	// +14:00 — at 06:00Z on Jan 1 the local date is 20:00 on Jan 1, and the
+	// DateOnly output must be 2023-01-01 (not the old-bug value 2022-12-31).
+	k, err := time.LoadLocation("Pacific/Kiritimati")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	got := dt.New("2023-01-01T06:00:00Z", dt.ToTimezone(k), dt.DateOnly())
+	if got != "2023-01-01" {
+		t.Errorf("DateOnly+Kiritimati = %q, want %q", got, "2023-01-01")
+	}
+}
+
+func TestOption_FormatAs_Unix(t *testing.T) {
+	got := dt.New(refISO, dt.FormatAs(dt.Unix()))
+	if got != "1673784000000" {
+		t.Errorf("FormatAs(Unix) = %q, want %q", got, "1673784000000")
+	}
+}
+
+func TestOption_FormatAs_ISOPreservesOffset(t *testing.T) {
+	// BUG-24: ISO() must use time.RFC3339 and preserve the offset, not force
+	// UTC with a literal "Z".
+	got := dt.New("2023-01-15T12:00:00-05:00", dt.FormatAs(dt.ISO()))
+	if got != "2023-01-15T12:00:00-05:00" {
+		t.Errorf("ISO() on -05:00 input = %q, want %q", got, "2023-01-15T12:00:00-05:00")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Custom pattern tokenizer — BUG-1 regression battery
+// ---------------------------------------------------------------------------
+
+func TestCustomPattern_LiteralWordsPreserved(t *testing.T) {
+	// Each case below mangled to garbage under the v0.1.0 cascading
+	// ReplaceAll implementation.
+	tests := []struct {
+		pattern string
+		want    string
+	}{
+		{"Month: MM", "Month: 01"},
+		{"Hour: HH", "Hour: 12"},
+		{"MMMM DD, YYYY", "January 15, 2023"},
+		{"HH:mm:ss.SSS", "12:00:00.000"},
+		{"Today is MMMM DD", "Today is January 15"},
+		{"[YYYY literal stays]", "[2023 literal stays]"},
+		{"DD-MM-YYYY HH:mm:ss", "15-01-2023 12:00:00"},
+		{"MMM D, YYYY", "Jan 15, 2023"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.pattern, func(t *testing.T) {
+			got := dt.New(refISO, dt.FormatAs(dt.Custom(tc.pattern)))
+			if got != tc.want {
+				t.Errorf("Custom(%q) = %q, want %q", tc.pattern, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCustomPattern_FractionalSeconds(t *testing.T) {
+	// Input has 123ms. v0.1.0 leaked "SSS" unchanged.
+	got := dt.New("2023-01-15T12:00:00.123Z", dt.FormatAs(dt.Custom("HH:mm:ss.SSS")))
+	if got != "12:00:00.123" {
+		t.Errorf("Custom(HH:mm:ss.SSS) = %q, want %q", got, "12:00:00.123")
+	}
+}
+
+func TestCustomPattern_BareMillis(t *testing.T) {
+	// SSS without a leading dot emits zero-padded millis as three digits.
+	got := dt.New("2023-01-15T12:00:00.007Z", dt.FormatAs(dt.Custom("HHmmssSSS")))
+	if got != "120000007" {
+		t.Errorf("Custom(HHmmssSSS) = %q, want %q", got, "120000007")
+	}
+}
+
+func TestCustomPattern_Empty(t *testing.T) {
+	got := dt.New(refISO, dt.FormatAs(dt.Custom("")))
+	if got != "" {
+		t.Errorf("Custom(\"\") = %q, want empty string", got)
+	}
+}
+
+func TestCustomPattern_AllLiteral(t *testing.T) {
+	got := dt.New(refISO, dt.FormatAs(dt.Custom("hello world")))
+	if got != "hello world" {
+		t.Errorf("Custom(\"hello world\") = %q, want literal", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ordinal day (DDD) patterns
+// ---------------------------------------------------------------------------
+
+func TestCustomPattern_OrdinalDay(t *testing.T) {
+	tests := []struct {
+		pattern  string
+		input    string
+		want     string
+	}{
+		{"MMM DDD, YYYY", "2023-01-01", "Jan 1st, 2023"},
+		{"YYYY-MM-DDD", "2023-01-02", "2023-01-2nd"},
+		{"DDD MMM YYYY", "2023-01-03", "3rd Jan 2023"},
+		{"MMM DDD", "2023-01-04", "Jan 4th"},
+		{"DDD/MM/YYYY", "2023-01-21", "21st/01/2023"},
+		{"DDD-MM-YY", "2023-01-22", "22nd-01-23"},
+		{"DDD of MMM", "2023-01-23", "23rd of Jan"},
+		{"DDD MMM", "2023-01-31", "31st Jan"},
+		// Teens edge: 11, 12, 13 all take "th", not "st/nd/rd"
+		{"DDD", "2023-01-11", "11th"},
+		{"DDD", "2023-01-12", "12th"},
+		{"DDD", "2023-01-13", "13th"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.pattern+"/"+tc.input, func(t *testing.T) {
+			got := dt.New(tc.input, dt.FormatAs(dt.Custom(tc.pattern)))
+			if got != tc.want {
+				t.Errorf("Custom(%q) on %q = %q, want %q", tc.pattern, tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ordinal day parsing (input side)
+// ---------------------------------------------------------------------------
+
+func TestParse_OrdinalInputs(t *testing.T) {
+	tests := []struct {
+		input string
+		want  time.Time
+	}{
+		{"jan 4th 25", time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC)},
+		{"feb 21st 2025", time.Date(2025, 2, 21, 0, 0, 0, 0, time.UTC)},
+		{"mar 2nd 2025", time.Date(2025, 3, 2, 0, 0, 0, 0, time.UTC)},
+		{"apr 3rd 2025", time.Date(2025, 4, 3, 0, 0, 0, 0, time.UTC)},
+		{"may 11th 2025", time.Date(2025, 5, 11, 0, 0, 0, 0, time.UTC)},
+		{"dec 31st 2025", time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{"january 4th 2025", time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC)},
+		{"Jan 4TH 25", time.Date(2025, 1, 4, 0, 0, 0, 0, time.UTC)},
+		// Mixed case: the regex-based approach handles any case combination.
+		{"Jan 2nD 2025", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := dt.Parse(tc.input)
+			if !got.Equal(tc.want) {
+				t.Errorf("Parse(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// String/int parity + wider numeric type support
+// ---------------------------------------------------------------------------
+
+func TestParityStringVsInt64(t *testing.T) {
+	// BUG-4: v0.1.0 rejected 9-digit numeric strings while accepting them as
+	// int64. The two paths must agree.
+	tests := []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"str 9 digit", "167257440", "1975-04-20T20:24:00Z"},
+		{"int64 9 digit", int64(167257440), "1975-04-20T20:24:00Z"},
+		{"str 10 digit", "1673784000", "2023-01-15T12:00:00Z"},
+		{"int64 10 digit", int64(1673784000), "2023-01-15T12:00:00Z"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dt.New(tc.v)
+			if got != tc.want {
+				t.Errorf("New(%v) = %q, want %q", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAllIntegerWidths(t *testing.T) {
+	// BUG-9: v0.1.0 default branch silently dropped uint/int32/etc.
+	const want = "2000-01-01T00:00:00Z"
+	sec := int64(946684800) // 2000-01-01T00:00:00Z
+	cases := []struct {
+		name string
+		v    any
+	}{
+		{"int", int(sec)},
+		{"int32", int32(sec)},
+		{"int64", sec},
+		{"uint32", uint32(sec)},
+		{"uint64", uint64(sec)},
+		{"uint", uint(sec)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dt.New(tc.v)
+			if got != want {
+				t.Errorf("New(%s %v) = %q, want %q", tc.name, tc.v, got, want)
+			}
+		})
+	}
+}
+
+func TestFloatNaNAndInfRejected(t *testing.T) {
+	// NaN must not silently produce a garbage time.Time. Every comparison
+	// with NaN is false so the range checks in parseUnixFloat would fall
+	// through to int64(NaN) (typically MinInt64 on amd64) without an
+	// explicit IsNaN guard. Same reasoning for ±Inf.
+	bad := []float64{
+		math.NaN(),
+		math.Inf(1),
+		math.Inf(-1),
+	}
+	for _, v := range bad {
+		if got := dt.Parse(v); !got.IsZero() {
+			t.Errorf("Parse(%v) = %v, want zero time", v, got)
+		}
+		if got := dt.New(v); got != "" {
+			t.Errorf("New(%v) = %q, want empty string", v, got)
+		}
+		if _, err := dt.ParseAny(v); err == nil {
+			t.Errorf("ParseAny(%v) err = nil, want non-nil", v)
+		}
+	}
+	// float32 NaN path must also be caught (it widens to float64 NaN).
+	if got := dt.Parse(float32(math.NaN())); !got.IsZero() {
+		t.Errorf("Parse(float32 NaN) = %v, want zero time", got)
+	}
+}
+
+func TestFloatSubSecondPrecision(t *testing.T) {
+	// BUG-7: v0.1.0 did int64(v), discarding the fractional second.
+	got := dt.Parse(float64(1673784000.999))
+	// Allow a few nanoseconds of float slack but assert millisecond precision.
+	wantMs := int64(1673784000999)
+	if gotMs := got.UnixMilli(); gotMs != wantMs {
+		t.Errorf("Parse(float with .999) UnixMilli = %d, want %d", gotMs, wantMs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RFC3339Nano / length cap
+// ---------------------------------------------------------------------------
+
+func TestParse_RFC3339Nano(t *testing.T) {
+	// BUG-3: v0.1.0 rejected inputs > 30 chars and had no nanosecond layout.
+	input := "2023-01-02T15:04:05.123456789-07:00"
+	got := dt.Parse(input)
+	if got.IsZero() {
+		t.Fatalf("Parse(%q) returned zero time", input)
+	}
+	if got.Nanosecond() != 123456789 {
+		t.Errorf("nanoseconds = %d, want 123456789", got.Nanosecond())
+	}
+	_, offset := got.Zone()
+	if offset != -7*3600 {
+		t.Errorf("offset = %d, want %d", offset, -7*3600)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Legacy API regression tests
+// ---------------------------------------------------------------------------
+
+func TestLegacyParseDatetime_RangeAligned(t *testing.T) {
+	// BUG-6: v0.1.0 ParseDatetime accepted up to 14 digits while
+	// parseUnixTimestamp capped at 13. They must agree now.
+	if _, err := dt.ParseDatetime(int64(99999999999999), "unix", ""); err == nil {
+		t.Error("ParseDatetime(14-digit int64) = nil, want range error")
+	}
+	if _, err := dt.ParseDatetime(int64(9999999999999), "unix", ""); err != nil {
+		t.Errorf("ParseDatetime(13-digit int64) err = %v, want nil", err)
+	}
+}
+
+func TestLegacyFormatDatetime_UnknownFormatTreatedAsGoLayout(t *testing.T) {
+	// BUG-5: v0.1.0 silently returned Unix millis for unknown format codes.
+	// Now, if the format contains no dt pattern tokens, it is treated as a
+	// raw Go time layout.
+	got, err := dt.FormatDatetime(1673784000000, "2006-01-02", "")
+	if err != nil {
+		t.Fatalf("FormatDatetime err = %v", err)
+	}
+	if got != "2023-01-15" {
+		t.Errorf("FormatDatetime(Go layout) = %q, want %q", got, "2023-01-15")
+	}
+}
+
+func TestLegacyFormatDatetime_CustomWithDTPattern(t *testing.T) {
+	got, err := dt.FormatDatetime(1673784000000, "custom", "YYYY-MM-DD")
+	if err != nil {
+		t.Fatalf("FormatDatetime err = %v", err)
+	}
+	if got != "2023-01-15" {
+		t.Errorf("FormatDatetime(custom YYYY-MM-DD) = %q, want %q", got, "2023-01-15")
+	}
+}
+
+func TestLegacyFormatDatetime_CustomWithGoLayout(t *testing.T) {
+	// v0.1.0 callers passed Go layouts as customPattern; that path is
+	// preserved for source compatibility.
+	got, err := dt.FormatDatetime(1673784000000, "custom", "2006-01-02")
+	if err != nil {
+		t.Fatalf("FormatDatetime err = %v", err)
+	}
+	if got != "2023-01-15" {
+		t.Errorf("FormatDatetime(custom 2006-01-02) = %q, want %q", got, "2023-01-15")
+	}
+}
+
+func TestLegacyFormatDatetime_CustomEmptyPatternErrors(t *testing.T) {
+	_, err := dt.FormatDatetime(1673784000000, "custom", "")
+	if err == nil {
+		t.Error("FormatDatetime(custom, empty) err = nil, want error")
+	}
+}
+
+func TestLegacyDetectDatetimeFormat(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"1673784000", "unix"},
+		{"1673784000000", "unix"},
+		{"2023-01-15T12:00:00Z", "iso"},
+		{"2023-01-15T12:00:00.123Z", "iso"},
+		{"2023-01-15T12:00:00-05:00", "iso-tz"},
+		{"2023-01-15T12:00:00.123-05:00", "iso-tz"},
+		{"2023-01-15", "date"},
+		{"01/15/2023", "custom"},
+		{"", "custom"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := dt.DetectDatetimeFormat(tc.input)
+			if got != tc.want {
+				t.Errorf("DetectDatetimeFormat(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLegacyIsValidDatetimeFormat(t *testing.T) {
+	// BUG-8: v0.1.0 returned true for everything except literal "invalid".
+	tests := []struct {
+		format string
+		want   bool
+	}{
+		{"unix", true},
+		{"iso", true},
+		{"iso-tz", true},
+		{"date", true},
+		{"custom", true},
+		{"YYYY-MM-DD", true},
+		{"DDD of MMM", true},
+		// Junk with no recognized tokens:
+		{"lolwut", false},
+		{"!!!", false},
+		{"invalid", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.format, func(t *testing.T) {
+			got := dt.IsValidDatetimeFormat(tc.format)
+			if got != tc.want {
+				t.Errorf("IsValidDatetimeFormat(%q) = %v, want %v", tc.format, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLegacyParseDatetime_Cases(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   any
+		format  string
+		pattern string
+		wantErr bool
+	}{
+		{"int64 timestamp", int64(1673784000), "unix", "", false},
+		{"float64 timestamp", float64(1673784000.5), "unix", "", false},
+		{"int timestamp", int(1673784000), "unix", "", false},
+		{"ISO string", "2023-01-15T12:00:00Z", "iso", "", false},
+		{"date string", "2023-01-15", "date", "", false},
+		{"custom format label", "01/15/2023", "custom", "", false},
+		{"unsupported type", []int{1, 2, 3}, "custom", "", true},
+		{"negative timestamp", int64(-1), "unix", "", true},
+		{"time.Time input", time.Date(2023, 1, 15, 12, 0, 0, 0, time.UTC), "iso", "", false},
+		{"zero time.Time rejected", time.Time{}, "iso", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := dt.ParseDatetime(tc.value, tc.format, tc.pattern)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("ParseDatetime(%v) err = nil, want error", tc.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseDatetime(%v) unexpected err: %v", tc.value, err)
+			}
+			if result.UnixMillis <= 0 {
+				t.Errorf("ParseDatetime(%v) UnixMillis = %d, want > 0", tc.value, result.UnixMillis)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Deprecated wrappers still work (source compat for v0.1.0 callers)
+// ---------------------------------------------------------------------------
+
+func TestDeprecated_NewDatetimeWrapsNew(t *testing.T) {
+	got := dt.NewDatetime(refISO)
+	want := dt.New(refISO)
+	if got != want {
+		t.Errorf("NewDatetime = %q, New = %q (should match)", got, want)
+	}
+}
+
+func TestDeprecated_ToDatetime(t *testing.T) {
+	got := dt.ToDatetime("2023-01-15T12:00:00Z")
+	if got.IsZero() {
+		t.Error("ToDatetime returned zero time for valid input")
+	}
+}
+
+func TestDeprecated_ParseTimeString(t *testing.T) {
+	if _, err := dt.ParseTimeString("2023-01-15T12:00:00Z"); err != nil {
+		t.Errorf("ParseTimeString err = %v", err)
+	}
+	if _, err := dt.ParseTimeString("not a date"); err == nil {
+		t.Error("ParseTimeString err = nil, want error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Junk-rejection: strings with trailing codes should not parse
+// ---------------------------------------------------------------------------
+
+func TestIsDatetime_TrailingJunkRejected(t *testing.T) {
+	rejected := []string{
+		"12/31/25 m353",
+		"01/15/23 X123",
+		"2023-01-01 A1B2",
+		"12/31/25 12345",
+		"01/15/23 123456",
+		"12/31/25 A",
+		"01/15/23 AB",
+	}
+	for _, input := range rejected {
+		t.Run(input, func(t *testing.T) {
+			if got := dt.New(input); got != "" {
+				t.Errorf("New(%q) = %q, want empty (trailing junk)", input, got)
+			}
+		})
+	}
+}
+
+func TestIsDatetime_ShortYearsAccepted(t *testing.T) {
+	accepted := []string{
+		"jan 4 25",
+		"jan 4 2025",
+		"jan 15 2025",
+	}
+	for _, input := range accepted {
+		t.Run(input, func(t *testing.T) {
+			if got := dt.New(input); got == "" {
+				t.Errorf("New(%q) = empty, want parsed value", input)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Round trip
+// ---------------------------------------------------------------------------
+
 func TestRoundTrip(t *testing.T) {
-	// Test that we can parse a datetime and format it back consistently
-	testCases := []string{
+	cases := []string{
 		"2024-01-15T10:30:00Z",
 		"2024-01-15",
 		"1705320600000",
 	}
-
-	for _, input := range testCases {
+	for _, input := range cases {
 		t.Run(input, func(t *testing.T) {
-			// Parse to time.Time
-			parsed := dt.ToDatetime(input)
+			parsed := dt.Parse(input)
 			if parsed.IsZero() {
-				t.Errorf("ToDatetime() failed to parse: %v", input)
-				return
+				t.Fatalf("Parse(%q) returned zero time", input)
 			}
-
-			// Format back to string
-			formatted := dt.NewDatetime(parsed)
-			if formatted == "" {
-				t.Errorf("NewDatetime() failed to format parsed time")
-			}
-		})
-	}
-}
-
-// Tests for legacy API functions (backward compatibility)
-
-func TestParseDatetime_Legacy(t *testing.T) {
-	tests := []struct {
-		name           string
-		value          any
-		expectedFormat string
-		customPattern  string
-		wantErr        bool
-	}{
-		// Numeric inputs
-		{"int64 timestamp", int64(1672574400), "unix", "", false},
-		{"float64 timestamp", float64(1672574400.5), "unix", "", false},
-		{"int timestamp", int(1672574400), "unix", "", false},
-
-		// String inputs
-		{"ISO string", "2023-01-01T12:00:00Z", "iso", "", false},
-		{"Date string", "2023-01-01", "date", "", false},
-		{"Custom format", "01/02/2023", "custom", "", false},
-
-		// Error cases
-		{"unsupported type", []int{1, 2, 3}, "custom", "", true},
-		{"invalid timestamp", int64(-1), "unix", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.ParseDatetime(tt.value, tt.expectedFormat, tt.customPattern)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseDatetime() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !tt.wantErr {
-				if result.UnixMillis <= 0 {
-					t.Errorf("ParseDatetime() UnixMillis = %v, want > 0", result.UnixMillis)
-				}
+			formatted := dt.New(parsed)
+			// The round-trip should be idempotent for time.Time inputs.
+			again := dt.Parse(formatted)
+			if !again.Equal(parsed) {
+				t.Errorf("round-trip mismatch: %v → %q → %v", parsed, formatted, again)
 			}
 		})
 	}
-}
-
-func TestFormatDatetime_Legacy(t *testing.T) {
-	// Use a known timestamp: 2023-01-01T12:00:00Z
-	timestamp := int64(1672574400000) // milliseconds
-
-	tests := []struct {
-		name          string
-		format        string
-		customPattern string
-		wantContains  string
-	}{
-		{"Unix format", "unix", "", "1672574400000"},
-		{"ISO format", "iso", "", "2023-01-01T12:00:00Z"},
-		{"Date format", "date", "", "2023-01-01"},
-		{"Custom format", "custom", "2006-01-02", "2023-01-01"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.FormatDatetime(timestamp, tt.format, tt.customPattern)
-			if err != nil {
-				t.Errorf("FormatDatetime() error = %v", err)
-				return
-			}
-			if tt.wantContains != "" && result != tt.wantContains {
-				t.Errorf("FormatDatetime() = %v, want %v", result, tt.wantContains)
-			}
-		})
-	}
-}
-
-func TestDetectDatetimeFormat_Legacy(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{"Unix timestamp", "1672574400", "unix"},
-		{"ISO format", "2023-01-01T12:00:00Z", "iso"},
-		{"ISO with timezone", "2023-01-01T12:00:00-05:00", "iso-tz"},
-		{"Date only", "2023-01-01", "date"},
-		{"Custom format", "01/02/2023", "custom"},
-		{"Empty string", "", "custom"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.DetectDatetimeFormat(tt.input)
-			if result != tt.expected {
-				t.Errorf("DetectDatetimeFormat() = %v, want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestIsValidDatetimeFormat_Legacy(t *testing.T) {
-	tests := []struct {
-		name     string
-		format   string
-		expected bool
-	}{
-		{"Unix format", "unix", true},
-		{"ISO format", "iso", true},
-		{"ISO-TZ format", "iso-tz", true},
-		{"Date format", "date", true},
-		{"Custom format", "custom", true},
-		{"Custom pattern", "YYYY-MM-DD", true},
-		{"Invalid format", "invalid", false},
-		{"Empty string", "", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := dt.IsValidDatetimeFormat(tt.format)
-			if result != tt.expected {
-				t.Errorf("IsValidDatetimeFormat() = %v, want %v", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestNewDatetimeAPI(t *testing.T) {
-	// Test basic NewDatetime functionality
-	result := dt.NewDatetime("2023-01-01T12:00:00Z")
-	if result == "" {
-		t.Error("NewDatetime should return a formatted string")
-	}
-
-	// Test ToDatetime functionality
-	parsed := dt.ToDatetime("2023-01-01T12:00:00Z")
-	if parsed.IsZero() {
-		t.Error("ToDatetime should return a valid time.Time")
-	}
-
-	// Test with options
-	dateOnly := dt.NewDatetime("2023-01-01T12:00:00Z", dt.DateOnly())
-	if dateOnly == "" {
-		t.Error("NewDatetime with DateOnly should return a formatted string")
-	}
-
-	// Test with format options
-	unixFormat := dt.NewDatetime("2023-01-01T12:00:00Z", dt.FormatAs(dt.Unix()))
-	if unixFormat == "" {
-		t.Error("NewDatetime with Unix format should return a formatted string")
-	}
-
-	// Test timezone conversion
-	ny, _ := time.LoadLocation("America/New_York")
-	withTz := dt.NewDatetime("2023-01-01T12:00:00Z", dt.ToTimezone(ny))
-	if withTz == "" {
-		t.Error("NewDatetime with timezone should return a formatted string")
-	}
-}
-
-func TestDatetimeFormats(t *testing.T) {
-	testTime := "2023-01-01T12:00:00Z"
-
-	// Test ISO format
-	iso := dt.NewDatetime(testTime, dt.FormatAs(dt.ISO()))
-	if iso == "" {
-		t.Error("ISO format should return a string")
-	}
-
-	// Test Unix format
-	unix := dt.NewDatetime(testTime, dt.FormatAs(dt.Unix()))
-	if unix == "" {
-		t.Error("Unix format should return a string")
-	}
-
-	// Test Custom format
-	custom := dt.NewDatetime(testTime, dt.FormatAs(dt.Custom("2006-01-02")))
-	if custom == "" {
-		t.Error("Custom format should return a string")
-	}
-}
-
-// Test legacy functions for improved coverage
-func TestParseDatetime(t *testing.T) {
-	tests := []struct {
-		name           string
-		value          any
-		expectedFormat string
-		customPattern  string
-		wantError      bool
-	}{
-		{"valid ISO string", "2023-01-01T12:00:00Z", "iso", "", false},
-		{"valid unix timestamp", int64(1672574400000), "unix", "", false},
-		{"valid date string", "2023-01-01", "date", "", false},
-		{"custom pattern", "01/02/2023", "custom", "01/02/2006", false},
-		{"invalid input", "invalid", "", "", true},
-		{"nil input", nil, "", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.ParseDatetime(tt.value, tt.expectedFormat, tt.customPattern)
-			if tt.wantError {
-				if err == nil {
-					t.Errorf("ParseDatetime() should return error for invalid input")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ParseDatetime() unexpected error: %v", err)
-				}
-				if result == nil {
-					t.Errorf("ParseDatetime() should return valid result")
-				}
-			}
-		})
-	}
-}
-
-func TestFormatDatetime(t *testing.T) {
-	unixMillis := int64(1672574400000) // 2023-01-01T12:00:00Z
-
-	tests := []struct {
-		name          string
-		format        string
-		customPattern string
-		wantError     bool
-	}{
-		{"ISO format", "iso", "", false},
-		{"Unix format", "unix", "", false},
-		{"Date format", "date", "", false},
-		{"Custom format", "custom", "2006-01-02", false},
-		{"Invalid format", "invalid", "", false}, // FormatDatetime doesn't validate format, just uses it
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.FormatDatetime(unixMillis, tt.format, tt.customPattern)
-			if tt.wantError {
-				if err == nil {
-					t.Errorf("FormatDatetime() should return error for invalid format")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("FormatDatetime() unexpected error: %v", err)
-				}
-				if result == "" {
-					t.Errorf("FormatDatetime() should return formatted string")
-				}
-			}
-		})
-	}
-}
-
-func TestIsDatetimeEdgeCases(t *testing.T) {
-	// Test various input types to improve isDatetime coverage
-	tests := []struct {
-		name  string
-		input any
-	}{
-		{"string input", "2023-01-01"},
-		{"int input", 123},
-		{"float input", 123.45},
-		{"bool input", true},
-		{"slice input", []string{"test"}},
-		{"map input", map[string]string{"key": "value"}},
-		{"struct input", struct{ Name string }{Name: "test"}},
-		{"nil input", nil},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// This will exercise the isDatetime function with various types
-			_ = dt.NewDatetime(tt.input)
-		})
-	}
-}
-
-func TestCustomFormatPatterns(t *testing.T) {
-	testTime := "2023-01-01T12:00:00Z"
-
-	// Test various custom patterns to improve convertPatternToGoLayout coverage
-	patterns := []string{
-		"YYYY-MM-DD",
-		"DD/MM/YYYY",
-		"MM-DD-YYYY HH:mm:ss",
-		"YYYY/MM/DD HH:mm",
-		"DD.MM.YYYY",
-		"HH:mm:ss",
-		"YYYY-MM-DD HH:mm:ss.SSS",
-	}
-
-	for _, pattern := range patterns {
-		t.Run("pattern_"+pattern, func(t *testing.T) {
-			result := dt.NewDatetime(testTime, dt.FormatAs(dt.Custom(pattern)))
-			if result == "" {
-				t.Errorf("Custom pattern %s should produce output", pattern)
-			}
-		})
-	}
-}
-
-func TestParseTimeStringExtended(t *testing.T) {
-	tests := []struct {
-		name      string
-		input     string
-		wantError bool
-	}{
-		{"valid ISO", "2023-01-01T12:00:00Z", false},
-		{"valid date", "2023-01-01", false},
-		{"invalid string", "not-a-date", true},
-		{"empty string", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := dt.ParseTimeString(tt.input)
-			if tt.wantError {
-				if err == nil {
-					t.Errorf("ParseTimeString() should return error for invalid input")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ParseTimeString() unexpected error: %v", err)
-				}
-				if result.IsZero() {
-					t.Errorf("ParseTimeString() should return valid time")
-				}
-			}
-		})
-	}
-}
-
-// Test uncovered functions to improve coverage
-func TestUncoveredDatetimeFunctions(t *testing.T) {
-	// Test more edge cases in isDatetime function (39.7% coverage)
-	t.Run("isDatetime_more_types", func(t *testing.T) {
-		// Test with pointer types
-		var intPtr *int
-		_ = dt.NewDatetime(intPtr)
-
-		// Test with any
-		var iface any = "2023-01-01"
-		_ = dt.NewDatetime(iface)
-
-		// Test with function type
-		fn := func() string { return "test" }
-		_ = dt.NewDatetime(fn)
-
-		// Test with array
-		arr := [3]string{"a", "b", "c"}
-		_ = dt.NewDatetime(arr)
-	})
-
-	// Test parseUnixTimestamp edge cases (80% coverage)
-	t.Run("unix_timestamp_edge_cases", func(t *testing.T) {
-		// Test very large timestamp
-		largeTimestamp := int64(9999999999999)
-		result := dt.NewDatetime(largeTimestamp)
-		if result == "" {
-			t.Errorf("Large timestamp should be handled")
-		}
-
-		// Test negative timestamp (may return empty for invalid timestamps)
-		negativeTimestamp := int64(-1)
-		result = dt.NewDatetime(negativeTimestamp)
-		// Negative timestamps may be invalid, so empty result is acceptable
-		_ = result
-
-		// Test zero timestamp
-		result = dt.NewDatetime(int64(0))
-		if result == "" {
-			t.Errorf("Zero timestamp should be handled")
-		}
-	})
-
-	// Test custom format edge cases (94.7% coverage)
-	t.Run("custom_format_edge_cases", func(t *testing.T) {
-		testTime := "2023-01-15T12:00:00Z"
-
-		// Test edge case patterns
-		edgePatterns := []string{
-			"",     // Empty pattern
-			"YYYY", // Year only
-			"MM",   // Month only
-			"DD",   // Day only
-			"HH",   // Hour only
-			"mm",   // Minute only
-			"ss",   // Second only
-			"SSS",  // Millisecond only
-		}
-
-		for _, pattern := range edgePatterns {
-			result := dt.NewDatetime(testTime, dt.FormatAs(dt.Custom(pattern)))
-			_ = result // Exercise the pattern conversion code
-		}
-	})
-
-	// Test parseDatetimeString edge cases (91.7% coverage)
-	t.Run("parseDatetimeString_edge_cases", func(t *testing.T) {
-		// Test various date formats to improve coverage
-		dateFormats := []string{
-			"2023/01/15",
-			"15.01.2023",
-			"01-15-2023",
-			"2023.01.15",
-			"15/01/2023",
-			"Jan 15, 2023",
-			"15 Jan 2023",
-			"2023-01-15 12:00:00",
-		}
-
-		for _, dateStr := range dateFormats {
-			result := dt.NewDatetime(dateStr)
-			_ = result // Exercise parsing code paths
-		}
-	})
-
-	// Test format conversion edge cases (66.7% coverage)
-	t.Run("format_conversion_edge_cases", func(t *testing.T) {
-		testTime := "2023-01-15T12:00:00Z"
-
-		// Test all format combinations
-		formats := []dt.DatetimeFormat{
-			dt.ISO(),
-			dt.Unix(),
-			dt.Custom("2006-01-02"),
-			dt.Custom("15:04:05"),
-			dt.Custom("2006/01/02 15:04:05"),
-		}
-
-		for _, format := range formats {
-			result := dt.NewDatetime(testTime, dt.FormatAs(format))
-			_ = result // Exercise format conversion code
-		}
-	})
-
-	// Test ParseDatetime with more edge cases (73.7% coverage)
-	t.Run("ParseDatetime_comprehensive", func(t *testing.T) {
-		// Test with time.Time input (may not be supported)
-		now := time.Now()
-		result, err := dt.ParseDatetime(now, "iso", "")
-		// time.Time input may not be supported, so error is acceptable
-		_ = result
-		_ = err
-
-		// Test with float input
-		result, err = dt.ParseDatetime(float64(1672574400), "unix", "")
-		if err != nil || result == nil {
-			t.Errorf("ParseDatetime should handle float64 input")
-		}
-
-		// Test with custom format and invalid pattern
-		result, err = dt.ParseDatetime("2023-01-15", "custom", "invalid-pattern")
-		// May fail, but exercises the code path
-		_ = result
-		_ = err
-	})
-
-	// Test FormatDatetime edge cases (75% coverage)
-	t.Run("FormatDatetime_edge_cases", func(t *testing.T) {
-		unixMillis := int64(1672574400000)
-
-		// Test with timezone format
-		result, err := dt.FormatDatetime(unixMillis, "isotz", "")
-		_ = result
-		_ = err
-
-		// Test with empty custom pattern
-		result, err = dt.FormatDatetime(unixMillis, "custom", "")
-		_ = result
-		_ = err
-	})
-
-	// Test remaining uncovered paths
-	t.Run("remaining_edge_cases", func(t *testing.T) {
-		// Test parseToTime with various input types
-		inputs := []any{
-			uint(1672574400),
-			uint32(1672574400),
-			uint64(1672574400000),
-			int32(1672574400),
-			float32(1672574400.0),
-		}
-
-		for _, input := range inputs {
-			result := dt.ToDatetime(fmt.Sprintf("%v", input))
-			_ = result // Exercise parseToTime with different numeric types
-		}
-
-		// Test custom format with more complex patterns
-		testTime := "2023-01-15T12:00:00Z"
-		complexPatterns := []string{
-			"YYYY-MM-DD'T'HH:mm:ss'Z'",
-			"DD MMM YYYY",
-			"MMM DD, YYYY HH:mm",
-		}
-
-		for _, pattern := range complexPatterns {
-			result := dt.NewDatetime(testTime, dt.FormatAs(dt.Custom(pattern)))
-			_ = result
-		}
-
-		// Test more parseToTime edge cases
-		edgeInputs := []string{
-			"1672574400000", // Millisecond timestamp as string
-			"1672574400",    // Second timestamp as string
-			"invalid-date",  // Invalid input
-			"",              // Empty string
-		}
-
-		for _, input := range edgeInputs {
-			result := dt.ToDatetime(input)
-			_ = result
-		}
-
-		// Test format interface edge cases to reach remaining coverage
-		testTime2 := "2023-01-15T12:00:00Z"
-
-		// Test format with DateOnly and TimeOnly options
-		result1 := dt.NewDatetime(testTime2, dt.DateOnly(), dt.FormatAs(dt.ISO()))
-		_ = result1
-
-		result2 := dt.NewDatetime(testTime2, dt.TimeOnly(), dt.FormatAs(dt.Custom("HH:mm:ss")))
-		_ = result2
-	})
-}
-
-func TestDatetimeCoverageBoost(t *testing.T) {
-	// Test more edge cases to boost coverage
-	t.Run("edge cases", func(t *testing.T) {
-		// Test with various invalid inputs to cover error paths
-		_ = dt.NewDatetime(nil)
-		_ = dt.NewDatetime([]int{1, 2, 3})
-		_ = dt.NewDatetime(map[string]int{"a": 1})
-
-		// Test more format combinations to increase coverage
-		result4 := dt.NewDatetime("2023-12-25", dt.FormatAs(dt.Custom("2006-01-02T15:04:05Z07:00")))
-		_ = result4
-
-		result5 := dt.NewDatetime("12:30:45", dt.FormatAs(dt.Custom("3:04PM")))
-		_ = result5
-
-		// Test invalid datetime with options
-		result6 := dt.NewDatetime("invalid", dt.DateOnly(), dt.FormatAs(dt.ISO()))
-		_ = result6
-	})
-}
-
-func TestDDDOrdinalDayFormatting(t *testing.T) {
-	// Test cases to cover the DDD ordinal day formatting pattern (line 375)
-	testCases := []struct {
-		name     string
-		pattern  string
-		datetime string
-		expected string
-	}{
-		{
-			name:     "DDD pattern with date",
-			pattern:  "MMM DDD, YYYY",
-			datetime: "2023-01-01",
-			expected: "Jan 1st, 2023",
-		},
-		{
-			name:     "DDD pattern with 2nd",
-			pattern:  "YYYY-MM-DDD",
-			datetime: "2023-01-02",
-			expected: "2023-01-2nd",
-		},
-		{
-			name:     "DDD pattern with 3rd",
-			pattern:  "DDD MMM YYYY",
-			datetime: "2023-01-03",
-			expected: "3rd Jan 2023",
-		},
-		{
-			name:     "DDD pattern with 4th",
-			pattern:  "MMM DDD",
-			datetime: "2023-01-04",
-			expected: "Jan 4th",
-		},
-		{
-			name:     "DDD pattern with 21st",
-			pattern:  "DDD/MM/YYYY",
-			datetime: "2023-01-21",
-			expected: "21st/01/2023",
-		},
-		{
-			name:     "DDD pattern with 22nd",
-			pattern:  "DDD-MM-YY",
-			datetime: "2023-01-22",
-			expected: "22nd-01-23",
-		},
-		{
-			name:     "DDD pattern with 23rd",
-			pattern:  "DDD of MMM",
-			datetime: "2023-01-23",
-			expected: "23rd of Jan",
-		},
-		{
-			name:     "DDD pattern with 31st",
-			pattern:  "DDD MMM",
-			datetime: "2023-01-31",
-			expected: "31st Jan",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Parse the datetime string to get Unix timestamp
-			parsedTime, err := time.Parse("2006-01-02", tc.datetime)
-			if err != nil {
-				t.Fatalf("Failed to parse test datetime %q: %v", tc.datetime, err)
-			}
-			unixMillis := parsedTime.UnixMilli()
-
-			// Test using FormatDatetime with custom DDD pattern
-			result, err := dt.FormatDatetime(unixMillis, "custom", tc.pattern)
-			if err != nil {
-				t.Fatalf("FormatDatetime failed: %v", err)
-			}
-
-			if result != tc.expected {
-				t.Errorf("FormatDatetime(%d, \"custom\", %q) = %q, expected %q",
-					unixMillis, tc.pattern, result, tc.expected)
-			}
-		})
-	}
-}
-
-func TestIsDatetimeTrailingContentLogic(t *testing.T) {
-	// Test cases to cover the trailing content logic in isDatetime function (lines 231-266)
-	// These test the edge cases where people accidentally append codes/notes after valid dates
-	testCases := []struct {
-		name     string
-		input    string
-		expected bool
-		reason   string
-	}{
-		// Test the exact scenario you mentioned - accidental codes after dates
-		{
-			name:     "date with accidental note code",
-			input:    "12/31/25 m353",
-			expected: false,
-			reason:   "Mixed alphanumeric codes like 'm353' should be rejected",
-		},
-		{
-			name:     "date with product code",
-			input:    "01/15/23 X123",
-			expected: false,
-			reason:   "Product codes with letters and numbers should be rejected",
-		},
-		{
-			name:     "date with ID code",
-			input:    "2023-01-01 A1B2",
-			expected: false,
-			reason:   "Mixed alphanumeric IDs should be rejected",
-		},
-
-		// Test numeric codes that should be rejected (>= 5 digits)
-		{
-			name:     "date with long numeric code",
-			input:    "12/31/25 12345",
-			expected: false,
-			reason:   "5+ digit numeric codes should be rejected",
-		},
-		{
-			name:     "date with very long numeric code",
-			input:    "01/15/23 123456",
-			expected: false,
-			reason:   "6+ digit numeric codes should be rejected",
-		},
-
-		// Test short letter codes (should be rejected, except AM/PM)
-		{
-			name:     "date with single letter code",
-			input:    "12/31/25 A",
-			expected: false,
-			reason:   "Single letter codes should be rejected",
-		},
-		{
-			name:     "date with two letter code",
-			input:    "01/15/23 AB",
-			expected: false,
-			reason:   "Two letter codes (not AM/PM) should be rejected",
-		},
-
-		// Test AM/PM patterns (exercises the AM/PM detection code path)
-		{
-			name:     "time with AM",
-			input:    "12:30:45 AM",
-			expected: false,
-			reason:   "Exercises AM detection code path (rejected by earlier validation)",
-		},
-		{
-			name:     "time with PM",
-			input:    "11:45:30 PM",
-			expected: false,
-			reason:   "Exercises PM detection code path (rejected by earlier validation)",
-		},
-
-		// Test short years that should be accepted (2-4 digits)
-		{
-			name:     "date with 2-digit year",
-			input:    "jan 4 25",
-			expected: true,
-			reason:   "2-digit years should be accepted",
-		},
-		{
-			name:     "date with 4-digit year",
-			input:    "jan 4 2025",
-			expected: true,
-			reason:   "4-digit years should be accepted",
-		},
-
-		// Test edge cases for trailing length
-		{
-			name:     "trailing length exactly 6 digits",
-			input:    "12/31/25 123456",
-			expected: false,
-			reason:   "Exactly 6 digit trailing should be rejected",
-		},
-		{
-			name:     "trailing length over 6 chars",
-			input:    "12/31/25 1234567",
-			expected: false,
-			reason:   "Exercises >6 char logic path (rejected by earlier validation)",
-		},
-
-		// Test valid datetime patterns that should pass
-		{
-			name:     "valid date with month name",
-			input:    "jan 15 2025",
-			expected: true,
-			reason:   "Valid date with month name should be accepted",
-		},
-		{
-			name:     "valid time format",
-			input:    "15:30:45",
-			expected: true,
-			reason:   "Valid time format should be accepted",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Test by trying to parse with NewDatetime - if isDatetime returns false,
-			// NewDatetime will return empty string
-			result := dt.NewDatetime(tc.input)
-			isEmpty := result == ""
-
-			if tc.expected {
-				if isEmpty {
-					t.Errorf("Expected %q to be accepted as datetime (reason: %s), but it was rejected",
-						tc.input, tc.reason)
-				}
-			} else {
-				if !isEmpty {
-					t.Errorf("Expected %q to be rejected as datetime (reason: %s), but it was accepted with result: %s",
-						tc.input, tc.reason, result)
-				}
-			}
-		})
-	}
-}
-
-// Test more datetime functions to increase coverage
-func TestMoreDatetimeFunctions(t *testing.T) {
-	// Test more ToDatetime edge cases with string inputs
-	result2 := dt.ToDatetime("")
-	_ = result2
-
-	result2 = dt.ToDatetime("not-a-date")
-	_ = result2
-
-	result2 = dt.ToDatetime("2023-01-01T12:00:00Z")
-	_ = result2
-
-	// Test more NewDatetime combinations
-	result3 := dt.NewDatetime("2023-01-01T12:00:00Z", dt.TimeOnly())
-	_ = result3
-
-	result3 = dt.NewDatetime("2023-01-01", dt.DateOnly(), dt.ToTimezone(time.UTC))
-	_ = result3
-
-	// Test FormatDatetime with various inputs
-	formatted, err := dt.FormatDatetime(1672574400, "2006-01-02", "UTC")
-	_ = formatted
-	_ = err
-
-	formatted, err = dt.FormatDatetime(0, "2006-01-02", "UTC")
-	_ = formatted
-	_ = err
-
-	// Test ParseDatetime with various patterns
-	parsed, err := dt.ParseDatetime("2023-01-01", "2006-01-02", "UTC")
-	_ = parsed
-	_ = err
-
-	parsed, err = dt.ParseDatetime("invalid", "2006-01-02", "UTC")
-	_ = parsed
-	_ = err
-}
-
-// Test additional datetime edge cases to push coverage over 80%
-func TestDatetimeCoverageBoostAdditional(t *testing.T) {
-	// Test more NewDatetime option combinations
-	result := dt.NewDatetime("2023-01-01T12:00:00Z", dt.DateOnly(), dt.TimeOnly())
-	_ = result
-
-	result = dt.NewDatetime("2023-01-01", dt.FormatAs(dt.Custom("Jan 2, 2006")))
-	_ = result
-
-	result = dt.NewDatetime("12:30:45", dt.FormatAs(dt.Custom("15:04:05")))
-	_ = result
-
-	// Test timezone with different locations
-	est, _ := time.LoadLocation("America/New_York")
-	result = dt.NewDatetime("2023-01-01T12:00:00Z", dt.ToTimezone(est))
-	_ = result
-
-	// Test more ToDatetime with different string formats
-	result2 := dt.ToDatetime("2023/01/01")
-	_ = result2
-
-	result2 = dt.ToDatetime("01-01-2023")
-	_ = result2
-
-	result2 = dt.ToDatetime("Jan 1, 2023")
-	_ = result2
-
-	// Test edge cases with timestamps
-	result2 = dt.ToDatetime("0")
-	_ = result2
-
-	result2 = dt.ToDatetime("-1")
-	_ = result2
 }
