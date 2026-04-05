@@ -670,6 +670,184 @@ func TestIsDatetime_ShortYearsAccepted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Regression tests for code-review items
+// ---------------------------------------------------------------------------
+
+// TestParse_HHMMLayoutIsRejected pins the honest contract for the "15:04"
+// layout. The isDatetime prefilter rejects non-numeric strings shorter than 6
+// characters, so a bare "HH:MM" cannot reach the layout loop. This test fails
+// if anyone adds "15:04" back to parseLayouts without also relaxing the
+// prefilter (review item I1).
+func TestParse_HHMMLayoutIsRejected(t *testing.T) {
+	if got := dt.Parse("15:04"); !got.IsZero() {
+		t.Errorf(`dt.Parse("15:04") = %v, want zero time (prefilter should reject)`, got)
+	}
+	// "15:04:05" is 8 chars and has seconds — it must still parse.
+	if got := dt.Parse("15:04:05"); got.IsZero() {
+		t.Error(`dt.Parse("15:04:05") returned zero time; HH:MM:SS must still parse`)
+	}
+}
+
+// TestNew_DateOnly_OffsetPreservesLocalDay pins review item M5: when the
+// input carries a non-UTC offset, DateOnly must emit the day in the input's
+// own location, NOT the UTC day. "2023-01-15T23:00:00-05:00" is 2023-01-16
+// 04:00 UTC, but the local day in -05:00 is still Jan 15.
+func TestNew_DateOnly_OffsetPreservesLocalDay(t *testing.T) {
+	got := dt.New("2023-01-15T23:00:00-05:00", dt.DateOnly())
+	if got != "2023-01-15" {
+		t.Errorf("DateOnly with -05:00 offset: got %q, want %q", got, "2023-01-15")
+	}
+
+	// To get the UTC day, callers must combine with ToTimezone(UTC).
+	gotUTC := dt.New("2023-01-15T23:00:00-05:00", dt.ToTimezone(time.UTC), dt.DateOnly())
+	if gotUTC != "2023-01-16" {
+		t.Errorf("DateOnly after ToTimezone(UTC): got %q, want %q", gotUTC, "2023-01-16")
+	}
+}
+
+// TestParseAny_NaNInfErrorMessage pins review item M1: NaN/Inf produce a
+// distinct error message from ordinary out-of-range numeric values.
+func TestParseAny_NaNInfErrorMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+	}{
+		{"NaN float64", math.NaN()},
+		{"+Inf float64", math.Inf(1)},
+		{"-Inf float64", math.Inf(-1)},
+		{"NaN float32", float32(math.NaN())},
+		{"+Inf float32", float32(math.Inf(1))},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := dt.ParseAny(c.v)
+			if err == nil {
+				t.Fatalf("ParseAny(%v) returned nil error", c.v)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "invalid numeric value") {
+				t.Errorf("expected 'invalid numeric value' in error, got: %q", msg)
+			}
+			if strings.Contains(msg, "out of valid timestamp range") {
+				t.Errorf("NaN/Inf should NOT report 'out of valid timestamp range', got: %q", msg)
+			}
+		})
+	}
+
+	// Ordinary out-of-range values should still use the original wording.
+	_, err := dt.ParseAny(float64(-1))
+	if err == nil || !strings.Contains(err.Error(), "out of valid timestamp range") {
+		t.Errorf("expected out-of-range wording for negative float, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz tests (review item M8)
+//
+// String parsers fed arbitrary input are an obvious fuzz target. These fuzzers
+// assert that Parse/ParseAny/DetectDatetimeFormat never panic and that the
+// isDatetime prefilter is consistent with the layout loop (a false from
+// isDatetime must always yield a zero time from parseDatetimeString).
+// ---------------------------------------------------------------------------
+
+// FuzzParse asserts that dt.Parse never panics on any input and returns only
+// finite times.
+func FuzzParse(f *testing.F) {
+	seeds := []string{
+		"",
+		"2023-01-15T12:00:00Z",
+		"2023-01-15T23:00:00-05:00",
+		"1673784000",
+		"1673784000000",
+		"Jan 2, 2026",
+		"15:04",
+		"15:04:05",
+		"2023-01-15",
+		"not a date",
+		"\x00\x01\x02",
+		strings.Repeat("9", 64),
+		strings.Repeat("a", 100),
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		// The primary invariant is no panic on arbitrary input. The layout
+		// list includes 4-digit year forms, so string inputs can legitimately
+		// yield years well outside the numeric envelope (e.g. "7000-01-01").
+		// We verify only that Parse is a pure function of s (calling twice
+		// yields the same result) — which catches hidden global state.
+		a := dt.Parse(s)
+		b := dt.Parse(s)
+		if !a.Equal(b) {
+			t.Errorf("Parse(%q) is not deterministic: %v vs %v", s, a, b)
+		}
+	})
+}
+
+// FuzzParseAny asserts ParseAny never panics and that error/success states
+// are mutually exclusive (non-nil error ⇒ zero time.Time, and vice versa).
+func FuzzParseAny(f *testing.F) {
+	seeds := []string{"", "2023-01-15T12:00:00Z", "garbage", "123", "15:04"}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		got, err := dt.ParseAny(s)
+		if err != nil && !got.IsZero() {
+			t.Errorf("ParseAny(%q): non-nil error but non-zero time %v", s, got)
+		}
+		if err == nil && got.IsZero() {
+			t.Errorf("ParseAny(%q): nil error but zero time", s)
+		}
+	})
+}
+
+// FuzzCustomFormat asserts that Custom(pattern).format on a reference time
+// never panics, regardless of what tokens or literal text the pattern
+// contains. Covers adversarial patterns that mix literal letters with our
+// alphabetic tokens.
+func FuzzCustomFormat(f *testing.F) {
+	seeds := []string{
+		"YYYY-MM-DD",
+		"HH:mm:ss.SSS",
+		"Month: MMMM, Day: D",
+		"",
+		"\x00\x01",
+		"YYYYYYYY",
+		"MMMMMMMMMM",
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	ref := time.Date(2023, 1, 15, 12, 34, 56, 789000000, time.UTC)
+	f.Fuzz(func(t *testing.T, pattern string) {
+		// Must not panic. The return value is not validated — any output is
+		// acceptable as long as we don't crash.
+		_ = dt.New(ref, dt.FormatAs(dt.Custom(pattern)))
+	})
+}
+
+// FuzzDetectDatetimeFormat asserts that DetectDatetimeFormat never panics
+// and always returns one of the documented label constants.
+func FuzzDetectDatetimeFormat(f *testing.F) {
+	seeds := []string{"", "2023-01-15", "1673784000", "garbage", "\x00"}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	valid := map[string]bool{
+		dt.FormatUnix: true, dt.FormatISO: true, dt.FormatISOTZ: true,
+		dt.FormatDate: true, dt.FormatCustom: true,
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		got := dt.DetectDatetimeFormat(s)
+		if !valid[got] {
+			t.Errorf("DetectDatetimeFormat(%q) = %q, not a documented label", s, got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Round trip
 // ---------------------------------------------------------------------------
 

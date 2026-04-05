@@ -41,13 +41,12 @@ jobs:
             git diff --exit-code go.sum
           fi
 
-      - name: Run tests (Unix)
-        if: runner.os != 'Windows'
+      # Go's race detector supports Windows/amd64, so -race runs everywhere.
+      # shell: bash keeps quoting consistent across Ubuntu/macOS/Windows runners.
+      - name: Run tests
+        shell: bash
         run: go test -v -race -coverprofile=coverage.out ./...
 
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
-        run: go test -v -coverprofile="coverage.out" ./...
-
-      - name: Run benchmarks
-        run: go test -bench=. -benchmem ./...
+      # Benchmarks are not run in CI. Without a baseline + benchstat comparison
+      # they produce cost without signal. Run locally on-demand via
+      # `go test -bench=. -benchmem ./...` when investigating performance.

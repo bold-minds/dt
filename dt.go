@@ -169,17 +169,20 @@ func Custom(pattern string) Format {
 type dateOnlyOption struct{}
 type timeOnlyOption struct{}
 type timezoneOption struct{ tz *time.Location }
-type formatAsOption struct{ format Format }
+type formatAsOption struct{ f Format }
 
-func (dateOnlyOption) apply(c *datetimeConfig)      { c.dateOnly = true }
-func (timeOnlyOption) apply(c *datetimeConfig)      { c.timeOnly = true }
-func (o timezoneOption) apply(c *datetimeConfig)    { c.timezone = o.tz }
-func (o formatAsOption) apply(c *datetimeConfig)    { c.outputFormat = o.format }
+func (dateOnlyOption) apply(c *datetimeConfig)   { c.dateOnly = true }
+func (timeOnlyOption) apply(c *datetimeConfig)   { c.timeOnly = true }
+func (o timezoneOption) apply(c *datetimeConfig) { c.timezone = o.tz }
+func (o formatAsOption) apply(c *datetimeConfig) { c.outputFormat = o.f }
 
 // DateOnly returns an option that zeros the time-of-day components and,
 // unless FormatAs is also provided, switches the default output format to
-// "2006-01-02". DateOnly and TimeOnly are mutually exclusive; passing both
-// causes New to return the empty string.
+// "2006-01-02". The calendar day is taken from the input's own location —
+// parsing "2023-01-15T23:00:00-05:00" with DateOnly yields "2023-01-15", not
+// the UTC day "2023-01-16". To select the day in a specific zone, combine
+// with ToTimezone. DateOnly and TimeOnly are mutually exclusive; passing
+// both causes New to return the empty string.
 func DateOnly() Option { return dateOnlyOption{} }
 
 // TimeOnly returns an option that zeros the date components (preserving the
@@ -194,7 +197,7 @@ func TimeOnly() Option { return timeOnlyOption{} }
 func ToTimezone(tz *time.Location) Option { return timezoneOption{tz: tz} }
 
 // FormatAs returns an option that selects the output format explicitly.
-func FormatAs(format Format) Option { return formatAsOption{format: format} }
+func FormatAs(format Format) Option { return formatAsOption{f: format} }
 
 // -----------------------------------------------------------------------------
 // Canonical API: New, Parse, ParseAny
@@ -272,9 +275,19 @@ func ParseAny(value any) (time.Time, error) {
 			return time.Time{}, fmt.Errorf("dt: zero time.Time is not a valid datetime")
 		case string:
 			return time.Time{}, fmt.Errorf("dt: cannot parse %q as datetime", v)
+		case float32:
+			f := float64(v)
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return time.Time{}, fmt.Errorf("dt: invalid numeric value %v is not a valid timestamp", v)
+			}
+			return time.Time{}, fmt.Errorf("dt: numeric value %v out of valid timestamp range", v)
+		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				return time.Time{}, fmt.Errorf("dt: invalid numeric value %v is not a valid timestamp", v)
+			}
+			return time.Time{}, fmt.Errorf("dt: numeric value %v out of valid timestamp range", v)
 		case int, int8, int16, int32, int64,
-			uint, uint8, uint16, uint32, uint64,
-			float32, float64:
+			uint, uint8, uint16, uint32, uint64:
 			return time.Time{}, fmt.Errorf("dt: numeric value %v out of valid timestamp range", v)
 		default:
 			return time.Time{}, fmt.Errorf("dt: unsupported type %T for datetime parsing", value)
@@ -311,7 +324,7 @@ func parseToTime(value any) time.Time {
 
 	// Unsigned integer widths. uint64 can exceed int64 range, so we check.
 	case uint:
-		if uint64(v) > uint64(1<<63-1) {
+		if uint64(v) > math.MaxInt64 {
 			return time.Time{}
 		}
 		return parseUnixTimestamp(int64(v))
@@ -322,7 +335,7 @@ func parseToTime(value any) time.Time {
 	case uint32:
 		return parseUnixTimestamp(int64(v))
 	case uint64:
-		if v > uint64(1<<63-1) {
+		if v > math.MaxInt64 {
 			return time.Time{}
 		}
 		return parseUnixTimestamp(int64(v))
@@ -343,25 +356,36 @@ func parseToTime(value any) time.Time {
 // callers get identical validity envelopes regardless of input type.
 const maxUnixMillis int64 = 9999999999999
 
+// unixSecondsMillisCutoff is the boundary between "interpret as seconds" and
+// "interpret as milliseconds" for numeric Unix timestamps. Values strictly
+// below 10^10 are seconds; values at or above it are milliseconds. 10^10
+// seconds ≈ year 2286, so any legitimate seconds-since-epoch value for the
+// foreseeable future is safely under this cutoff.
+const unixSecondsMillisCutoff int64 = 10_000_000_000
+
 // parseUnixTimestamp converts an integer Unix timestamp to time.Time. Values
-// with fewer than 10 digits (< 10^10) are interpreted as seconds; larger
-// values up to maxUnixMillis are interpreted as milliseconds. Microsecond and
-// nanosecond timestamps are rejected — callers that need them should convert
-// to time.Time directly.
+// with fewer than 10 digits (< unixSecondsMillisCutoff) are interpreted as
+// seconds; larger values up to maxUnixMillis are interpreted as milliseconds.
+// Microsecond and nanosecond timestamps are rejected — callers that need them
+// should convert to time.Time directly.
+//
+// Numeric inputs carry no zone information; the returned time is always UTC.
+// To render in another zone, combine with ToTimezone.
 func parseUnixTimestamp(timestamp int64) time.Time {
 	if timestamp < 0 || timestamp > maxUnixMillis {
 		return time.Time{}
 	}
-	if timestamp < 10000000000 { // < 10^10: interpret as seconds
+	if timestamp < unixSecondsMillisCutoff {
 		return time.Unix(timestamp, 0).UTC()
 	}
 	return time.UnixMilli(timestamp).UTC()
 }
 
 // parseUnixFloat converts a float Unix timestamp to time.Time, preserving
-// fractional seconds. Values < 10^10 are treated as seconds (fractional part
-// is nanoseconds); values >= 10^10 are treated as milliseconds (fractional
-// part is discarded — sub-millisecond precision is not representable there).
+// fractional seconds. Values < unixSecondsMillisCutoff are treated as seconds
+// (fractional part is nanoseconds); values >= unixSecondsMillisCutoff are
+// treated as milliseconds (fractional part is discarded — sub-millisecond
+// precision is not representable there). Returned times are always UTC.
 //
 // NaN and ±Inf are rejected explicitly. Every comparison with NaN is false,
 // so without this guard a NaN input would fall through the range checks into
@@ -375,8 +399,12 @@ func parseUnixFloat(v float64) time.Time {
 	if v < 0 || v > float64(maxUnixMillis) {
 		return time.Time{}
 	}
-	if v < 10000000000 {
+	if v < float64(unixSecondsMillisCutoff) {
 		sec := int64(v)
+		// nsec can round to exactly 1e9 for values like 1673784000.9999999999;
+		// time.Unix normalizes that by rolling into the next second, so the
+		// output is correct without an explicit clamp here. Intentional
+		// reliance on time.Unix's normalization contract.
 		nsec := int64((v - float64(sec)) * 1e9)
 		return time.Unix(sec, nsec).UTC()
 	}
@@ -438,6 +466,9 @@ func isDatetime(s string) bool {
 			hasSeparator = true
 		case (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
 			letterCount++
+			// Cap at 12: the longest legitimate prefix is "September" (9) plus
+			// a short suffix such as " 2," (letters-only count stays ≤ 12).
+			// Anything longer is non-datetime text (URLs, sentences, etc.).
 			if letterCount > 12 {
 				return false
 			}
@@ -508,7 +539,10 @@ var parseLayouts = [...]string{
 	time.RFC3339Nano,
 	"2006-01-02",
 	"15:04:05",
-	"15:04",
+	// Note: "15:04" (HH:MM only) is intentionally NOT in this list. The
+	// isDatetime prefilter rejects non-numeric strings shorter than 6 chars,
+	// so a 5-char layout could never be reached. Callers needing HH:MM should
+	// supply seconds ("15:04:00") or use time.Parse directly.
 	"01/02/2006", // US
 	"1/2/2006",
 	"02/01/2006", // European

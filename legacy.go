@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,11 @@ func ToDatetime(value string) time.Time { return parseDatetimeString(value) }
 func ParseDatetime(value any, expectedFormat string, customPattern string) (*ParseResult, error) {
 	var t time.Time
 
+	// Flat switch: every integer width widens to int64 and shares a single
+	// handler via toUnixFromInt64. Every float width canonicalizes to float64.
+	// Previously this function did tail recursion through itself for each
+	// width, which re-ran the full type switch and format-detection step per
+	// call; the flat form is a straight fall-through with no re-entry.
 	switch v := value.(type) {
 	case string:
 		t = parseDatetimeString(v)
@@ -54,44 +60,85 @@ func ParseDatetime(value any, expectedFormat string, customPattern string) (*Par
 		}
 		t = v
 	case int64:
-		if v < 0 || v > maxUnixMillis {
-			return nil, fmt.Errorf("dt: timestamp out of valid range: %d", v)
+		parsed, err := toUnixFromInt64(v)
+		if err != nil {
+			return nil, err
 		}
-		t = parseUnixTimestamp(v)
+		t = parsed
 	case int:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case int8:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case int16:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case int32:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case uint8:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case uint16:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case uint32:
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case uint:
 		// uint is 32 or 64 bits depending on platform; on 64-bit it can
 		// exceed int64 range, so guard explicitly (gosec G115).
 		if uint64(v) > math.MaxInt64 {
 			return nil, fmt.Errorf("dt: timestamp out of valid range: %d", v)
 		}
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	case uint64:
 		if v > math.MaxInt64 {
 			return nil, fmt.Errorf("dt: timestamp out of valid range: %d", v)
 		}
-		return ParseDatetime(int64(v), expectedFormat, customPattern)
-	case float64:
-		parsed := parseUnixFloat(v)
-		if parsed.IsZero() {
-			return nil, fmt.Errorf("dt: timestamp out of valid range: %v", v)
+		parsed, err := toUnixFromInt64(int64(v))
+		if err != nil {
+			return nil, err
 		}
 		t = parsed
 	case float32:
-		return ParseDatetime(float64(v), expectedFormat, customPattern)
+		parsed, err := toUnixFromFloat64(float64(v))
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
+	case float64:
+		parsed, err := toUnixFromFloat64(v)
+		if err != nil {
+			return nil, err
+		}
+		t = parsed
 	default:
 		return nil, fmt.Errorf("dt: unsupported type for datetime parsing: %T", value)
 	}
@@ -113,6 +160,28 @@ func ParseDatetime(value any, expectedFormat string, customPattern string) (*Par
 	}, nil
 }
 
+// toUnixFromInt64 range-checks an int64 and returns the parsed time. It is
+// the shared handler used by every integer arm of ParseDatetime's type switch.
+func toUnixFromInt64(v int64) (time.Time, error) {
+	if v < 0 || v > maxUnixMillis {
+		return time.Time{}, fmt.Errorf("dt: timestamp out of valid range: %d", v)
+	}
+	return parseUnixTimestamp(v), nil
+}
+
+// toUnixFromFloat64 rejects NaN/Inf and range-checks v before delegating to
+// parseUnixFloat. Shared between the float32 and float64 arms of ParseDatetime.
+func toUnixFromFloat64(v float64) (time.Time, error) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return time.Time{}, fmt.Errorf("dt: invalid numeric value %v is not a valid timestamp", v)
+	}
+	parsed := parseUnixFloat(v)
+	if parsed.IsZero() {
+		return time.Time{}, fmt.Errorf("dt: timestamp out of valid range: %v", v)
+	}
+	return parsed, nil
+}
+
 // Package-scope detection regexes. Compiled once at import time instead of
 // once per DetectDatetimeFormat call.
 var (
@@ -128,7 +197,7 @@ var (
 // Deprecated: format detection is a weak signal and the returned label has
 // no operational meaning for the canonical API.
 func DetectDatetimeFormat(input string) string {
-	input = trimSpace(input)
+	input = strings.TrimSpace(input)
 	if input == "" {
 		return FormatCustom
 	}
@@ -144,20 +213,6 @@ func DetectDatetimeFormat(input string) string {
 	default:
 		return FormatCustom
 	}
-}
-
-// trimSpace is a package-local alias to avoid pulling strings into legacy.go
-// just for one call (and to keep the deprecated file's imports minimal).
-func trimSpace(s string) string {
-	i := 0
-	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
-		i++
-	}
-	j := len(s)
-	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\n' || s[j-1] == '\r') {
-		j--
-	}
-	return s[i:j]
 }
 
 // IsValidDatetimeFormat reports whether format is either a known format

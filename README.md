@@ -35,6 +35,13 @@ go get github.com/bold-minds/dt
 
 Requires Go 1.21 or later.
 
+> **Go version support.** `dt` intentionally targets Go 1.21 as its floor so
+> the Goby library family maintains broad source compatibility. Go 1.21 is
+> past upstream security support — the floor is a minimum-supported
+> source-compatibility commitment, not the toolchain used to build the tests.
+> CI runs the test suite (with `-race`) on the latest Go. The floor will be
+> bumped when a specific feature requires it.
+
 ## 🎯 Quick Start
 
 ```go
